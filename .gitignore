@@ -1,0 +1,71 @@
+# Python
+*.py[cod]
+*$py.class
+*.so
+__pycache__/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+env/
+venv/
+ENV/
+.venv/
+pip-log.txt
+
+# Django
+*.log
+local_settings.py
+media/
+staticfiles/
+static_root/
+
+# Database - PostgreSQL dumps and backups
+*.sql
+*.dump
+*.backup
+db_backup/
+*.psql
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+.hypothesis/
+
+
+# Migrations (optional - uncomment if you want to exclude migration files)
+# */migrations/*.py
+# !*/migrations/__init__.py
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
