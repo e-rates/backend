@@ -86,8 +86,7 @@ The API will be available at `http://127.0.0.1:8000/`
 e-rates/
 ├── config/          # Project settings
 ├── erates/          # Main app
-├── env/             # Virtual environment (not in git)
-├── db.sqlite3       # Database (not in git)
+├── env/             # Virtual environment (not in git)   
 ├── manage.py        # Django management script
 └── requirements.txt # Python dependencies
 ```
@@ -97,7 +96,7 @@ e-rates/
 - Django
 - Django REST Framework
 - Django REST Framework GIS (if using geographic data)
-- SQLite (development) / PostgreSQL (production recommended)
+- PostgreSQL
 
 ## Contributing
 
