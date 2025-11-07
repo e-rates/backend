@@ -13,7 +13,7 @@ A Django REST Framework application for managing e-rates.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/e-rates.git
+git clone https://github.com/gdeniss/e-rates.git
 cd e-rates
 ```
 
