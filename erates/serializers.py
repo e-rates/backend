@@ -3,8 +3,11 @@ from rest_framework_gis.serializers import GeoFeatureModelSerializer
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import MinLengthValidator, EmailValidator
 from django.utils import timezone
+from datetime import datetime, timedelta
+from django.db.models import Sum, Count, Avg, Q
 from decimal import Decimal
 import re
+from drf_spectacular.utils import extend_schema_field
 
 from .models import (
     User, Account, Parcel, ParcelHistory, 
@@ -194,7 +197,8 @@ class AccountSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
     
-    def get_balance_verified(self, obj):
+    @extend_schema_field(serializers.BooleanField)
+    def get_balance_verified(self, obj) -> bool:
         return obj.verify_balance_integrity()
     
     def to_representation(self, instance):
@@ -228,6 +232,7 @@ class ParcelSerializer(GeoFeatureModelSerializer):
     class Meta:
         model = Parcel
         geo_field = 'geom'
+        id_field = 'parcel_id'
         fields = [
             'parcel_id', 'owner_user', 'owner_username', 'parcel_ref',
             'geom', 'centroid', 'area_m2', 'status', 'props',
@@ -256,12 +261,12 @@ class ParcelSerializer(GeoFeatureModelSerializer):
         return value
 
 
-class ParcelListSerializer(GeoFeatureModelSerializer):
+class ParcelListSerializer(serializers.ModelSerializer):
+    """List serializer without geometry for better performance"""
     owner_username = serializers.CharField(source='owner_user.username', read_only=True)
     
     class Meta:
         model = Parcel
-        geo_field = None
         fields = [
             'parcel_id', 'owner_username', 'parcel_ref',
             'area_m2', 'status'
@@ -279,6 +284,7 @@ class ParcelHistorySerializer(GeoFeatureModelSerializer):
     class Meta:
         model = ParcelHistory
         geo_field = 'geom'
+        id_field = 'history_id'
         fields = [
             'history_id', 'parcel', 'parcel_ref', 'owner_user', 'owner_username',
             'geom', 'area_m2', 'changed_by', 'changed_by_username',
@@ -300,7 +306,8 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields  # Ledger entries are immutable
     
-    def get_integrity_verified(self, obj):
+    @extend_schema_field(serializers.BooleanField)
+    def get_integrity_verified(self, obj) -> bool:
         """Verify entry integrity"""
         return obj.verify_integrity()
     
@@ -340,21 +347,36 @@ class PaymentSerializer(serializers.ModelSerializer):
     user_username = serializers.CharField(source='user.username', read_only=True)
     account_type = serializers.CharField(source='account.account_type', read_only=True)
     integrity_verified = serializers.SerializerMethodField()
+    is_defaulter = serializers.SerializerMethodField()
+    days_overdue = serializers.SerializerMethodField()
     
     class Meta:
         model = Payment
         fields = [
             'payment_id', 'user', 'user_username', 'account', 'account_type',
-            'amount', 'currency', 'processor', 'status', 'integrity_verified',
+            'amount', 'currency', 'processor', 'status', 'deadline', 
+            'is_defaulter', 'days_overdue', 'integrity_verified',
             'failure_reason', 'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'payment_id', 'integrity_verified', 'created_at', 'updated_at'
+            'payment_id', 'integrity_verified', 'is_defaulter', 
+            'days_overdue', 'created_at', 'updated_at'
         ]
     
-    def get_integrity_verified(self, obj):
+    @extend_schema_field(serializers.BooleanField)
+    def get_integrity_verified(self, obj) -> bool:
         """Verify payment integrity"""
         return obj.verify_integrity()
+    
+    @extend_schema_field(serializers.BooleanField)
+    def get_is_defaulter(self, obj) -> bool:
+        """Check if payment is overdue"""
+        return obj.is_defaulter()
+    
+    @extend_schema_field(serializers.IntegerField)
+    def get_days_overdue(self, obj):
+        """Get number of days overdue"""
+        return obj.days_overdue()
     
     def to_representation(self, instance):
         """Hide sensitive processor details"""
@@ -375,7 +397,7 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
         model = Payment
         fields = [
             'user', 'account', 'amount', 'currency',
-            'processor', 'idempotency_key', 'metadata'
+            'processor', 'deadline', 'idempotency_key', 'metadata'
         ]
     
     def validate_amount(self, value):
@@ -421,10 +443,6 @@ class AuditLogSerializer(serializers.ModelSerializer):
         return data
 
 
-# ============================================================================
-# SUMMARY SERIALIZERS (for reporting/analytics)
-# ============================================================================
-
 class AccountSummarySerializer(serializers.Serializer):
     """Account summary for dashboard/reporting"""
     total_accounts = serializers.IntegerField()
@@ -440,3 +458,140 @@ class UserActivitySerializer(serializers.Serializer):
     total_transactions = serializers.IntegerField()
     total_parcels = serializers.IntegerField()
     last_activity = serializers.DateTimeField()
+
+class DateRangeSerializer(serializers.Serializer):
+    """Base serializer for date range filtering"""
+    start_date = serializers.DateField(required=False)
+    end_date = serializers.DateField(required=False)
+    period = serializers.ChoiceField(
+        choices=['today', 'week', 'month', 'quarter', 'year', 'custom'],
+        required=False,
+        default='month'
+    )
+    
+    def validate(self, attrs):
+        if attrs.get('period') == 'custom':
+            if not attrs.get('start_date') or not attrs.get('end_date'):
+                raise serializers.ValidationError(
+                    "start_date and end_date are required for custom period"
+                )
+        return attrs
+    
+class UserReportSerializer(serializers.Serializer):
+    """User statistics report"""
+    total_users = serializers.IntegerField()
+    active_users = serializers.IntegerField()
+    verified_users = serializers.IntegerField()
+    users_by_role = serializers.DictField()
+    new_users_count = serializers.IntegerField()
+    locked_accounts = serializers.IntegerField()
+    users_with_parcels = serializers.IntegerField()
+    users_with_accounts = serializers.IntegerField()
+
+class AccountReportSerializer(serializers.Serializer):
+    """Account statistics report"""
+    total_accounts = serializers.IntegerField()
+    active_accounts = serializers.IntegerField()
+    frozen_accounts = serializers.IntegerField()
+    closed_accounts = serializers.IntegerField()
+    total_balance = serializers.DecimalField(max_digits=20, decimal_places=2)
+    average_balance = serializers.DecimalField(max_digits=20, decimal_places=2)
+    accounts_by_type = serializers.DictField()
+    accounts_by_currency = serializers.DictField()
+
+class PaymentReportSerializer(serializers.Serializer):
+    """Payment statistics report"""
+    total_payments = serializers.IntegerField()
+    completed_payments = serializers.IntegerField()
+    pending_payments = serializers.IntegerField()
+    failed_payments = serializers.IntegerField()
+    refunded_payments = serializers.IntegerField()
+    total_amount = serializers.DecimalField(max_digits=20, decimal_places=2)
+    average_payment = serializers.DecimalField(max_digits=20, decimal_places=2)
+    payments_by_processor = serializers.DictField()
+    payments_by_currency = serializers.DictField()
+    success_rate = serializers.FloatField()
+
+
+class ParcelReportSerializer(serializers.Serializer):
+    """Parcel statistics report"""
+    total_parcels = serializers.IntegerField()
+    active_parcels = serializers.IntegerField()
+    disputed_parcels = serializers.IntegerField()
+    transferred_parcels = serializers.IntegerField()
+    archived_parcels = serializers.IntegerField()
+    total_area_m2 = serializers.FloatField()
+    average_area_m2 = serializers.FloatField()
+    parcels_by_owner = serializers.ListField()
+
+class LedgerReportSerializer(serializers.Serializer):
+    """Ledger statistics report"""
+    total_entries = serializers.IntegerField()
+    total_credits = serializers.DecimalField(max_digits=20, decimal_places=2)
+    total_debits = serializers.DecimalField(max_digits=20, decimal_places=2)
+    total_transfers = serializers.DecimalField(max_digits=20, decimal_places=2)
+    entries_by_type = serializers.DictField()
+    entries_by_account_type = serializers.DictField()
+
+class TransactionVolumeSerializer(serializers.Serializer):
+    """Transaction volume over time"""
+    date = serializers.DateField()
+    count = serializers.IntegerField()
+    total_amount = serializers.DecimalField(max_digits=20, decimal_places=2)
+    avg_amount = serializers.DecimalField(max_digits=20, decimal_places=2)
+
+
+class TopUserSerializer(serializers.Serializer):
+    """Top users by activity"""
+    user_id = serializers.UUIDField()
+    username = serializers.CharField()
+    transaction_count = serializers.IntegerField()
+    total_amount = serializers.DecimalField(max_digits=20, decimal_places=2)
+    parcel_count = serializers.IntegerField()
+    account_count = serializers.IntegerField()
+
+class RevenueReportSerializer(serializers.Serializer):
+    """Revenue and fee report"""
+    total_revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+    total_fees = serializers.DecimalField(max_digits=20, decimal_places=2)
+    revenue_by_period = serializers.ListField()
+    revenue_by_source = serializers.DictField()
+
+
+class ComprehensiveReportSerializer(serializers.Serializer):
+    """Comprehensive system report"""
+    period = serializers.CharField()
+    generated_at = serializers.DateTimeField()
+    users = UserReportSerializer()
+    accounts = AccountReportSerializer()
+    payments = PaymentReportSerializer()
+    parcels = ParcelReportSerializer()
+    ledger = LedgerReportSerializer()
+    transaction_volume = serializers.ListField(child=TransactionVolumeSerializer())
+    top_users = serializers.ListField(child=TopUserSerializer())
+
+
+class DefaulterSerializer(serializers.Serializer):
+    """Serializer for defaulters - users with overdue payments"""
+    user_id = serializers.UUIDField()
+    username = serializers.CharField()
+    email = serializers.EmailField()
+    phone = serializers.CharField(required=False, allow_null=True)
+    payment_id = serializers.UUIDField()
+    amount = serializers.DecimalField(max_digits=20, decimal_places=2)
+    currency = serializers.CharField()
+    deadline = serializers.DateTimeField()
+    days_overdue = serializers.IntegerField()
+    status = serializers.CharField()
+    created_at = serializers.DateTimeField()
+    metadata = serializers.JSONField(required=False, allow_null=True)
+
+
+class DefaultersSummarySerializer(serializers.Serializer):
+    """Summary statistics for defaulters"""
+    total_defaulters = serializers.IntegerField()
+    total_overdue_amount = serializers.DecimalField(max_digits=20, decimal_places=2)
+    average_days_overdue = serializers.FloatField()
+    defaulters_by_currency = serializers.DictField()
+    defaulters = serializers.ListField(child=DefaulterSerializer())
+

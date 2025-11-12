@@ -9,6 +9,7 @@ from .views import (
     LedgerEntryViewSet,
     PaymentViewSet,
     AuditLogViewSet,
+    ReportsViewSet,
 )
 
 router = DefaultRouter()
@@ -19,6 +20,7 @@ router.register(r'parcel-history', ParcelHistoryViewSet)
 router.register(r'ledger-entries', LedgerEntryViewSet)
 router.register(r'payments', PaymentViewSet)
 router.register(r'audit-logs', AuditLogViewSet)
+router.register(r'reports', ReportsViewSet, basename='reports')
 
 urlpatterns = [
     path('', include(router.urls)),

@@ -61,6 +61,8 @@ INSTALLED_APPS = [
     'rest_framework_gis',
     'django_filters',
     'rest_framework_simplejwt',
+    'corsheaders',
+    'drf_spectacular',  # API documentation
 
     #local apps
     'erates',
@@ -68,6 +70,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -95,6 +98,31 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
+
+CORS_ALLOW_ALL_ORIGINS = True
+
+CORS_ALLOW_CREDENTIALS = True
+
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
@@ -199,7 +227,8 @@ REST_FRAMEWORK = {
     
     'DEFAULT_METADATA_CLASS': 'rest_framework.metadata.SimpleMetadata',
     
-    'DEFAULT_SCHEMA_CLASS': 'rest_framework.schemas.openapi.AutoSchema',
+    # Use drf-spectacular for OpenAPI 3.0 schema generation
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     
     'DATETIME_FORMAT': '%Y-%m-%dT%H:%M:%S.%fZ',
     'DATE_FORMAT': '%Y-%m-%d',
@@ -234,4 +263,60 @@ SIMPLE_JWT = {
     'SLIDING_TOKEN_REFRESH_EXP_CLAIM': 'refresh_exp',
     'SLIDING_TOKEN_LIFETIME': timedelta(minutes=60),
     'SLIDING_TOKEN_REFRESH_LIFETIME': timedelta(days=7),
+}
+
+# drf-spectacular settings for API documentation
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'E-Rates API',
+    'DESCRIPTION': 'Comprehensive API for E-Rates land parcel management system with account ledger, payments, and GIS functionality',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    
+    # Authentication configuration
+    'AUTHENTICATION_WHITELIST': [
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ],
+    'SECURITY': [
+        {
+            'Bearer': [],
+        }
+    ],
+    'SECURITY_DEFINITIONS': {
+        'Bearer': {
+            'type': 'http',
+            'scheme': 'bearer',
+            'bearerFormat': 'JWT',
+        }
+    },
+    
+    # Schema generation settings
+    'SCHEMA_PATH_PREFIX': r'/api/',
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SCHEMA_COERCE_PATH_PK': True,
+    
+    # Disable problematic extensions
+    'DISABLE_ERRORS_AND_WARNINGS': True,
+    
+    # Swagger UI settings
+    'SWAGGER_UI_SETTINGS': {
+        'deepLinking': True,
+        'persistAuthorization': True,
+        'displayOperationId': True,
+        'filter': True,
+    },
+    
+    # Additional settings
+    'SERVE_PERMISSIONS': ['rest_framework.permissions.AllowAny'],
+    'SERVE_AUTHENTICATION': [],
+    'POSTPROCESSING_HOOKS': [],
+    'ENUM_NAME_OVERRIDES': {},
+    'TAGS': [
+        {'name': 'Users', 'description': 'User management and authentication'},
+        {'name': 'Accounts', 'description': 'Financial accounts management'},
+        {'name': 'Parcels', 'description': 'Land parcel management with GIS'},
+        {'name': 'Ledger', 'description': 'Ledger entries and transactions'},
+        {'name': 'Payments', 'description': 'Payment processing'},
+        {'name': 'Audit', 'description': 'Audit logs and history'},
+        {'name': 'Auth', 'description': 'Authentication endpoints'},
+    ],
 }

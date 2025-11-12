@@ -2,6 +2,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework import serializers
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema, OpenApiResponse
 from .models import User
 
 
@@ -81,6 +82,16 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         return token
 
 
+@extend_schema(
+    summary="Obtain JWT token pair (username/email)",
+    description="Authenticate using username or email and password to obtain JWT access and refresh tokens.",
+    tags=['Auth'],
+    request=CustomTokenObtainPairSerializer,
+    responses={
+        200: OpenApiResponse(description="Token pair obtained successfully"),
+        400: OpenApiResponse(description="Invalid credentials"),
+    },
+)
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
 
@@ -188,6 +199,16 @@ class PhoneTokenObtainPairSerializer(TokenObtainPairSerializer):
         return token
 
 
+@extend_schema(
+    summary="Obtain JWT token pair (phone)",
+    description="Authenticate using phone number and password to obtain JWT access and refresh tokens.",
+    tags=['Auth'],
+    request=PhoneTokenObtainPairSerializer,
+    responses={
+        200: OpenApiResponse(description="Token pair obtained successfully"),
+        400: OpenApiResponse(description="Invalid credentials"),
+    },
+)
 class PhoneTokenObtainPairView(TokenObtainPairView):
     """
     Custom view for obtaining JWT token pair using phone number.
