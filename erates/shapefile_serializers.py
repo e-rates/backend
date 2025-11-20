@@ -14,6 +14,25 @@ class ShapefileUploadSerializer(serializers.Serializer):
         help_text="ZIP file containing shapefile (.shp, .shx, .dbf, .prj, etc.)"
     )
     
+    county = serializers.CharField(
+        required=False,
+        max_length=100,
+        help_text="County name"
+    )
+    
+    sub_county = serializers.CharField(
+        required=False,
+        max_length=100,
+        help_text="Sub-county name"
+    )
+    
+    ward = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=100,
+        help_text="Ward name (optional)"
+    )
+    
     ref_field = serializers.CharField(
         required=False,
         default='PARCEL_ID',
@@ -41,6 +60,18 @@ class ShapefileUploadSerializer(serializers.Serializer):
         help_text="Clear existing parcels before importing"
     )
     
+    auto_generate_ref = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Auto-generate parcel reference for features missing parcel number. If false, features without parcel numbers will be skipped."
+    )
+    
+    source_epsg = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        help_text="Source EPSG code if shapefile is missing .prj file (e.g., 21037 for Kenya UTM Zone 37S, 32737 for WGS84 UTM Zone 37S)"
+    )
+    
     def validate_zip_file(self, value):
         """Validate that uploaded file is a ZIP"""
         if not value.name.endswith('.zip'):
@@ -61,7 +92,12 @@ class ShapefileImportResultSerializer(serializers.Serializer):
     imported_count = serializers.IntegerField()
     skipped_count = serializers.IntegerField()
     error_count = serializers.IntegerField()
+    warning_count = serializers.IntegerField(required=False)
     errors = serializers.ListField(
+        child=serializers.CharField(),
+        required=False
+    )
+    warnings = serializers.ListField(
         child=serializers.CharField(),
         required=False
     )

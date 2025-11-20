@@ -510,9 +510,201 @@ class ParcelViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
     @extend_schema(
-        summary="Transfer parcel ownership",
-        description="Transfer ownership of a parcel to another user. Creates a history record.",
+        summary="Assign or transfer parcel ownership",
+        description="Assign an owner to an unassigned parcel or transfer ownership to another user. Creates a history record.",
         tags=['Parcels'],
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'new_owner_id': {'type': 'string', 'format': 'uuid', 'description': 'UUID of the new owner'}
+                },
+                'required': ['new_owner_id']
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Parcel ownership assigned/transferred successfully"),
+            400: OpenApiResponse(description="Invalid request data"),
+            404: OpenApiResponse(description="New owner not found"),
+        },
+    )
+    @action(detail=True, methods=['post'], permission_classes=[IsAdminOrAuditor])
+    def assign_owner(self, request, pk=None):
+        """Assign owner to unassigned parcel or transfer ownership"""
+        parcel = self.get_object()
+        new_owner_id = request.data.get('new_owner_id')
+        
+        if not new_owner_id:
+            return Response(
+                {'error': 'new_owner_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            new_owner = User.objects.get(user_id=new_owner_id)
+            old_owner = parcel.owner_user
+            
+            parcel.owner_user = new_owner
+            # Only set to 'transferred' if there was a previous owner
+            if old_owner:
+                parcel.status = 'transferred'
+            else:
+                parcel.status = 'active'
+            parcel.save()
+            
+            # Create history record
+            ParcelHistory.objects.create(
+                parcel=parcel,
+                owner_user=new_owner,
+                geom=parcel.geom,
+                area_m2=parcel.area_m2,
+                changed_by=request.user,
+                change_reason=f'Ownership {"transferred to" if old_owner else "assigned to"} {new_owner.username}'
+            )
+            
+            return Response({
+                'message': f'Parcel {"transferred" if old_owner else "assigned"} successfully',
+                'parcel_id': parcel.parcel_id,
+                'parcel_ref': parcel.parcel_ref,
+                'previous_owner': old_owner.username if old_owner else None,
+                'new_owner': new_owner.username
+            })
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'New owner not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+    
+    @extend_schema(
+        summary="Bulk assign owners to parcels",
+        description="Assign owners to multiple parcels at once. Useful after bulk upload.",
+        tags=['Parcels'],
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'assignments': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'parcel_id': {'type': 'string', 'format': 'uuid'},
+                                'owner_id': {'type': 'string', 'format': 'uuid'}
+                            }
+                        }
+                    }
+                },
+                'required': ['assignments']
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Bulk assignment completed"),
+            400: OpenApiResponse(description="Invalid request data"),
+        },
+    )
+    @action(detail=False, methods=['post'], permission_classes=[IsAdminOrAuditor])
+    def bulk_assign_owners(self, request):
+        """Bulk assign owners to multiple parcels"""
+        assignments = request.data.get('assignments', [])
+        
+        if not assignments:
+            return Response(
+                {'error': 'assignments array is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        success_count = 0
+        failed_count = 0
+        errors = []
+        
+        for assignment in assignments:
+            parcel_id = assignment.get('parcel_id')
+            owner_id = assignment.get('owner_id')
+            
+            if not parcel_id or not owner_id:
+                failed_count += 1
+                errors.append({'parcel_id': parcel_id, 'error': 'Missing parcel_id or owner_id'})
+                continue
+            
+            try:
+                parcel = Parcel.objects.get(parcel_id=parcel_id)
+                owner = User.objects.get(user_id=owner_id)
+                
+                old_owner = parcel.owner_user
+                parcel.owner_user = owner
+                if old_owner:
+                    parcel.status = 'transferred'
+                else:
+                    parcel.status = 'active'
+                parcel.save()
+                
+                # Create history
+                ParcelHistory.objects.create(
+                    parcel=parcel,
+                    owner_user=owner,
+                    geom=parcel.geom,
+                    area_m2=parcel.area_m2,
+                    changed_by=request.user,
+                    change_reason=f'Bulk assignment to {owner.username}'
+                )
+                
+                success_count += 1
+                
+            except Parcel.DoesNotExist:
+                failed_count += 1
+                errors.append({'parcel_id': parcel_id, 'error': 'Parcel not found'})
+            except User.DoesNotExist:
+                failed_count += 1
+                errors.append({'parcel_id': parcel_id, 'error': 'Owner not found'})
+            except Exception as e:
+                failed_count += 1
+                errors.append({'parcel_id': parcel_id, 'error': str(e)})
+        
+        return Response({
+            'success': failed_count == 0,
+            'message': f'Assigned {success_count} parcels, {failed_count} failed',
+            'success_count': success_count,
+            'failed_count': failed_count,
+            'errors': errors[:20]  # Limit errors shown
+        })
+    
+    @extend_schema(
+        summary="Get unassigned parcels",
+        description="Retrieve all parcels that don't have an owner assigned yet.",
+        tags=['Parcels'],
+        responses={200: ParcelListSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminOrAuditor])
+    def unassigned(self, request):
+        """Get parcels without owners"""
+        parcels = Parcel.objects.filter(owner_user__isnull=True, is_deleted=False)
+        
+        # Apply filters
+        county = request.query_params.get('county')
+        if county:
+            parcels = parcels.filter(props__county=county)
+        
+        sub_county = request.query_params.get('sub_county')
+        if sub_county:
+            parcels = parcels.filter(props__sub_county=sub_county)
+        
+        ward = request.query_params.get('ward')
+        if ward:
+            parcels = parcels.filter(props__ward=ward)
+        
+        page = self.paginate_queryset(parcels)
+        if page is not None:
+            serializer = ParcelListSerializer(page, many=True, context={'request': request})
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = ParcelListSerializer(parcels, many=True, context={'request': request})
+        return Response(serializer.data)
+    
+    @extend_schema(
+        summary="Transfer parcel ownership (Legacy)",
+        description="Transfer ownership of a parcel to another user. Creates a history record. Use assign_owner instead.",
+        tags=['Parcels'],
+        deprecated=True,
         request={
             'application/json': {
                 'type': 'object',
@@ -530,41 +722,9 @@ class ParcelViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=['post'])
     def transfer(self, request, pk=None):
-        """Transfer parcel ownership"""
-        parcel = self.get_object()
-        new_owner_id = request.data.get('new_owner_id')
-        
-        if not new_owner_id:
-            return Response(
-                {'error': 'new_owner_id is required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            new_owner = User.objects.get(user_id=new_owner_id)
-            parcel.owner_user = new_owner
-            parcel.status = 'transferred'
-            parcel.save()
-            
-            ParcelHistory.objects.create(
-                parcel=parcel,
-                owner_user=new_owner,
-                geom=parcel.geom,
-                area_m2=parcel.area_m2,
-                changed_by=request.user,
-                change_reason=f'Ownership transferred to {new_owner.username}'
-            )
-            
-            return Response({
-                'message': 'Parcel transferred successfully',
-                'parcel_id': parcel.parcel_id,
-                'new_owner': new_owner.username
-            })
-        except User.DoesNotExist:
-            return Response(
-                {'error': 'New owner not found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        """Transfer parcel ownership (use assign_owner instead)"""
+        # Redirect to assign_owner
+        return self.assign_owner(request, pk)
     
     @extend_schema(
         summary="Get all parcels as GeoJSON FeatureCollection",
@@ -595,8 +755,8 @@ class ParcelViewSet(viewsets.ModelViewSet):
         Return all parcels as a single GeoJSON FeatureCollection.
         Optimized for frontend map visualization with Leaflet.
         """
+        import json
         from django.contrib.gis.geos import Polygon as GEOSPolygon
-        from django.contrib.gis.db.models.functions import Envelope, Simplify
         
         # Start with base queryset
         queryset = self.get_queryset().filter(is_deleted=False)
@@ -609,6 +769,19 @@ class ParcelViewSet(viewsets.ModelViewSet):
         owner_filter = request.query_params.get('owner')
         if owner_filter:
             queryset = queryset.filter(owner_user_id=owner_filter)
+        
+        # Location filters (county, sub_county, ward)
+        county_filter = request.query_params.get('county')
+        if county_filter:
+            queryset = queryset.filter(props__county=county_filter)
+        
+        sub_county_filter = request.query_params.get('sub_county')
+        if sub_county_filter:
+            queryset = queryset.filter(props__sub_county=sub_county_filter)
+        
+        ward_filter = request.query_params.get('ward')
+        if ward_filter:
+            queryset = queryset.filter(props__ward=ward_filter)
         
         # Bounding box filter (format: min_lon,min_lat,max_lon,max_lat)
         bbox = request.query_params.get('bbox')
@@ -648,23 +821,28 @@ class ParcelViewSet(viewsets.ModelViewSet):
                 geom = geom.simplify(tolerance=simplify_tolerance, preserve_topology=True)
             
             # Convert to GeoJSON dict
+            # Use geom.json to properly serialize geometry to GeoJSON
+            geometry_dict = None
+            if geom:
+                try:
+                    geometry_dict = json.loads(geom.json)
+                except Exception:
+                    geometry_dict = None
+            
             feature = {
                 'type': 'Feature',
                 'id': str(parcel.parcel_id),
-                'geometry': {
-                    'type': geom.geom_type if geom else None,
-                    'coordinates': geom.coords if geom else None,
-                } if geom else None,
+                'geometry': geometry_dict,
                 'properties': {
                     'parcel_ref': parcel.parcel_ref,
-                    'owner_username': parcel.owner_user.username,
-                    'owner_id': str(parcel.owner_user.user_id),
-                    'area_m2': parcel.area_m2,
-                    'area_acres': round(parcel.area_m2 / 4046.86, 2) if parcel.area_m2 else None,
+                    'owner_username': parcel.owner_user.username if parcel.owner_user else None,
+                    'owner_id': str(parcel.owner_user.user_id) if parcel.owner_user else None,
+                    'area_m2': float(parcel.area_m2) if parcel.area_m2 else None,
+                    'area_acres': round(float(parcel.area_m2) / 4046.86, 2) if parcel.area_m2 else None,
                     'status': parcel.status,
                     'centroid': {
-                        'lat': parcel.centroid.y if parcel.centroid else None,
-                        'lng': parcel.centroid.x if parcel.centroid else None,
+                        'lat': float(parcel.centroid.y) if parcel.centroid else None,
+                        'lng': float(parcel.centroid.x) if parcel.centroid else None,
                     } if parcel.centroid else None,
                     'created_at': parcel.created_at.isoformat() if parcel.created_at else None,
                     'updated_at': parcel.updated_at.isoformat() if parcel.updated_at else None,
@@ -704,6 +882,11 @@ class ParcelViewSet(viewsets.ModelViewSet):
         - .shx file (required)
         - .dbf file (required)
         - .prj file (recommended for coordinate system info)
+        
+        If shapefile is missing .prj file or has coordinate system issues:
+        - Provide source_epsg parameter (e.g., 21037 for Kenya Arc 1960 UTM 37S)
+        - Common Kenya EPSG codes: 21037, 32737 (UTM), 4326 (WGS84 Lat/Long)
+        - Set auto_generate_ref=true to auto-generate missing parcel numbers
         """
         serializer = ShapefileUploadSerializer(data=request.data)
         
@@ -715,12 +898,18 @@ class ParcelViewSet(viewsets.ModelViewSet):
         
         # Get validated data
         zip_file = serializer.validated_data['zip_file']
+        county = serializer.validated_data.get('county')
+        sub_county = serializer.validated_data.get('sub_county')
+        ward = serializer.validated_data.get('ward')
         ref_field = serializer.validated_data.get('ref_field', 'PARCEL_ID')
         parcel_status = serializer.validated_data.get('status', 'active')
         owner_username = serializer.validated_data.get('owner_username')
         clear_existing = serializer.validated_data.get('clear_existing', False)
+        auto_generate_ref = serializer.validated_data.get('auto_generate_ref', False)
+        source_epsg = serializer.validated_data.get('source_epsg')
         
-        # Determine owner
+        # Determine owner (optional - can be assigned later)
+        owner_user = None
         if owner_username:
             try:
                 owner_user = User.objects.get(username=owner_username)
@@ -729,8 +918,16 @@ class ParcelViewSet(viewsets.ModelViewSet):
                     {'success': False, 'message': f'User not found: {owner_username}'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-        else:
-            owner_user = request.user
+        # Note: owner_user can be None - admin will assign owners later via UI
+        
+        # Build location metadata
+        location_metadata = {}
+        if county:
+            location_metadata['county'] = county
+        if sub_county:
+            location_metadata['sub_county'] = sub_county
+        if ward:
+            location_metadata['ward'] = ward
         
         # Create importer
         importer = ShapefileImporter(
@@ -738,7 +935,10 @@ class ParcelViewSet(viewsets.ModelViewSet):
             ref_field=ref_field,
             status=parcel_status,
             owner_user=owner_user,
-            clear_existing=clear_existing
+            clear_existing=clear_existing,
+            location_metadata=location_metadata,
+            auto_generate_ref=auto_generate_ref,
+            source_epsg=source_epsg
         )
         
         try:

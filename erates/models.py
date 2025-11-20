@@ -206,7 +206,10 @@ class Parcel(SecurityMixin):
     owner_user = models.ForeignKey(
         User, 
         on_delete=models.PROTECT,
-        related_name="parcels"
+        related_name="parcels",
+        null=True,
+        blank=True,
+        help_text="Property owner (can be assigned later)"
     )
     parcel_ref = models.CharField(max_length=100, unique=True, db_index=True)
     geom = gis_models.GeometryField(srid=4326)
@@ -231,6 +234,31 @@ class Parcel(SecurityMixin):
             models.Index(fields=['owner_user', 'status']),
             models.Index(fields=['parcel_ref']),
         ]
+    
+    def clean(self):
+        """Validate geometry coordinates are within WGS84 bounds"""
+        super().clean()
+        
+        if self.geom:
+            try:
+                # Check if coordinates are within valid WGS84 range
+                # Longitude: -180 to 180, Latitude: -90 to 90
+                extent = self.geom.extent  # Returns (xmin, ymin, xmax, ymax)
+                
+                if extent[0] < -180 or extent[2] > 180:
+                    raise ValidationError(
+                        f"Longitude out of valid range (-180 to 180): {extent[0]} to {extent[2]}"
+                    )
+                
+                if extent[1] < -90 or extent[3] > 90:
+                    raise ValidationError(
+                        f"Latitude out of valid range (-90 to 90): {extent[1]} to {extent[3]}"
+                    )
+            except ValidationError:
+                raise
+            except Exception as e:
+                raise ValidationError(f"Invalid geometry: {str(e)}")
+    
     def save(self, *args, **kwargs):
         """Auto-calculate centroid and area if not provided"""
         if self.geom:
@@ -280,7 +308,7 @@ class Parcel(SecurityMixin):
 class ParcelHistory(models.Model):
     history_id = models.BigAutoField(primary_key=True)
     parcel = models.ForeignKey(Parcel, on_delete=models.PROTECT, related_name="history")
-    owner_user = models.ForeignKey(User, on_delete=models.PROTECT, null=True)
+    owner_user = models.ForeignKey(User, on_delete=models.PROTECT, null=True, blank=True)
     geom = gis_models.GeometryField(srid=4326)
     area_m2 = models.FloatField(blank=True, null=True)
     changed_by = models.ForeignKey(

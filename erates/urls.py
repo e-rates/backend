@@ -22,6 +22,15 @@ router.register(r'payments', PaymentViewSet)
 router.register(r'audit-logs', AuditLogViewSet)
 router.register(r'reports', ReportsViewSet, basename='reports')
 
+# Admin router (same viewsets, just different URL prefix for frontend compatibility)
+admin_router = DefaultRouter()
+admin_router.register(r'parcels', ParcelViewSet)
+admin_router.register(r'users', UserViewSet)
+admin_router.register(r'accounts', AccountViewSet)
+admin_router.register(r'payments', PaymentViewSet)
+admin_router.register(r'reports', ReportsViewSet, basename='admin-reports')
+
 urlpatterns = [
     path('', include(router.urls)),
+    path('admin/', include(admin_router.urls)),  # Add /admin/ prefix for frontend
 ]

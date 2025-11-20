@@ -227,14 +227,21 @@ class AccountListSerializer(serializers.ModelSerializer):
 
 class ParcelSerializer(GeoFeatureModelSerializer):
  
-    owner_username = serializers.CharField(source='owner_user.username', read_only=True)
+    owner_username = serializers.SerializerMethodField()
+    owner_email = serializers.SerializerMethodField()
+    
+    def get_owner_username(self, obj):
+        return obj.owner_user.username if obj.owner_user else None
+    
+    def get_owner_email(self, obj):
+        return obj.owner_user.email if obj.owner_user else None
     
     class Meta:
         model = Parcel
         geo_field = 'geom'
         id_field = 'parcel_id'
         fields = [
-            'parcel_id', 'owner_user', 'owner_username', 'parcel_ref',
+            'parcel_id', 'owner_user', 'owner_username', 'owner_email', 'parcel_ref',
             'geom', 'centroid', 'area_m2', 'status', 'props',
             'created_at', 'updated_at'
         ]
@@ -263,12 +270,19 @@ class ParcelSerializer(GeoFeatureModelSerializer):
 
 class ParcelListSerializer(serializers.ModelSerializer):
     """List serializer without geometry for better performance"""
-    owner_username = serializers.CharField(source='owner_user.username', read_only=True)
+    owner_username = serializers.SerializerMethodField()
+    owner_id = serializers.SerializerMethodField()
+    
+    def get_owner_username(self, obj):
+        return obj.owner_user.username if obj.owner_user else None
+    
+    def get_owner_id(self, obj):
+        return str(obj.owner_user.user_id) if obj.owner_user else None
     
     class Meta:
         model = Parcel
         fields = [
-            'parcel_id', 'owner_username', 'parcel_ref',
+            'parcel_id', 'owner_id', 'owner_username', 'parcel_ref',
             'area_m2', 'status'
         ]
         read_only_fields = fields
