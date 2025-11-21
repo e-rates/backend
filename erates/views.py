@@ -1402,6 +1402,212 @@ class PaymentViewSet(viewsets.ModelViewSet):
         },
     )
     @action(detail=True, methods=['post'], permission_classes=[IsAdminOrAuditor])
+    def refund(self, request, pk=None):
+        """Refund payment (admin only)"""
+        payment = self.get_object()
+        
+        if payment.status != 'completed':
+            return Response(
+                {'error': 'Can only refund completed payments'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        payment.status = 'refunded'
+        payment.save()
+        
+        return Response({
+            'message': 'Payment refunded successfully',
+            'payment_id': payment.payment_id,
+            'status': payment.status
+        })
+    
+       @extend_schema(
+        summary="Get list of defaulters",
+        description="Retrieve users with overdue payments. Supports filtering by location, amount, and days overdue.",
+        tags=['Payments'],
+        parameters=[
+            OpenApiParameter('min_days_overdue', OpenApiTypes.INT, description='Minimum days overdue (default: 1)'),
+            OpenApiParameter('max_days_overdue', OpenApiTypes.INT, description='Maximum days overdue'),
+            OpenApiParameter('currency', OpenApiTypes.STR, description='Filter by currency'),
+            OpenApiParameter('min_amount', OpenApiTypes.FLOAT, description='Minimum payment amount'),
+            OpenApiParameter('ward', OpenApiTypes.STR, description='Filter by ward'),
+            OpenApiParameter('sub_county', OpenApiTypes.STR, description='Filter by sub-county'),
+            OpenApiParameter('county', OpenApiTypes.STR, description='Filter by county'),
+            OpenApiParameter('search', OpenApiTypes.STR, description='Search by username, email, phone, or parcel ref'),
+        ],
+        responses={200: DefaulterSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminOrAuditor])
+    def defaulters(self, request):
+        """Get list of users with overdue payments"""
+        from .serializers import DefaulterSerializer
+        from django.db.models import Q
+        
+        # Get all overdue payments (past deadline and not completed/refunded)
+        now = timezone.now()
+        
+        # Base query: overdue payments
+        overdue_payments = Payment.objects.filter(
+            deadline__lt=now,
+            status__in=['pending', 'processing', 'failed']
+        ).select_related('user', 'account').prefetch_related('user__parcels')
+        
+        # 1. Filter by Days Overdue
+        min_days = request.query_params.get('min_days_overdue', 1)
+        try:
+            min_days = int(min_days)
+            cutoff_date_min = now - timedelta(days=min_days)
+            overdue_payments = overdue_payments.filter(deadline__lte=cutoff_date_min)
+        except ValueError:
+            pass
+            
+        max_days = request.query_params.get('max_days_overdue')
+        if max_days:
+            try:
+                max_days = int(max_days)
+                cutoff_date_max = now - timedelta(days=max_days)
+                overdue_payments = overdue_payments.filter(deadline__gte=cutoff_date_max)
+            except ValueError:
+                pass
+        
+        # 2. Filter by Amount & Currency
+        currency_filter = request.query_params.get('currency')
+        if currency_filter:
+            overdue_payments = overdue_payments.filter(currency=currency_filter)
+        
+        min_amount = request.query_params.get('min_amount')
+        if min_amount:
+            try:
+                min_amount = Decimal(min_amount)
+                overdue_payments = overdue_payments.filter(amount__gte=min_amount)
+            except (ValueError, Decimal.InvalidOperation):
+                pass
+
+        # 3. Filter by Location (Ward, Sub-county, County)
+        ward = request.query_params.get('ward')
+        if ward:
+            overdue_payments = overdue_payments.filter(user__parcels__ward__iexact=ward).distinct()
+            
+        sub_county = request.query_params.get('sub_county')
+        if sub_county:
+            overdue_payments = overdue_payments.filter(user__parcels__sub_county__iexact=sub_county).distinct()
+            
+        county = request.query_params.get('county')
+        if county:
+            overdue_payments = overdue_payments.filter(user__parcels__county__iexact=county).distinct()
+
+        # 4. Search (User details or Parcel Ref)
+        search_query = request.query_params.get('search')
+        if search_query:
+            overdue_payments = overdue_payments.filter(
+                Q(user__username__icontains=search_query) |
+                Q(user__email__icontains=search_query) |
+                Q(user__phone__icontains=search_query) |
+                Q(user__parcels__parcel_ref__icontains=search_query)
+            ).distinct()
+
+        # Order by most overdue first
+        overdue_payments = overdue_payments.order_by('deadline')
+        
+        # Pagination
+        page = self.paginate_queryset(overdue_payments)
+        if page is not None:
+            results = []
+            for payment in page:
+                days_overdue = (now - payment.deadline).days
+                
+                # Get parcels for this user
+                user_parcels = payment.user.parcels.all()
+                parcels_data = [
+                    {
+                        'parcel_ref': p.parcel_ref,
+                        'ward': p.ward,
+                        'sub_county': p.sub_county,
+                        'county': p.county,
+                        'centroid': {
+                            'lat': p.centroid.y,
+                            'lon': p.centroid.x
+                        } if p.centroid else None
+                    }
+                    for p in user_parcels
+                ]
+
+                results.append({
+                    'user_id': payment.user.user_id,
+                    'username': payment.user.username,
+                    'email': payment.user.email,
+                    'phone': payment.user.phone,
+                    'payment_id': payment.payment_id,
+                    'amount': payment.amount,
+                    'currency': payment.currency,
+                    'deadline': payment.deadline,
+                    'days_overdue': days_overdue,
+                    'status': payment.status,
+                    'created_at': payment.created_at,
+                    'metadata': payment.metadata,
+                    'parcels': parcels_data
+                })
+            
+            serializer = DefaulterSerializer(results, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        # Fallback if pagination is disabled
+        results = []
+        for payment in overdue_payments:
+            days_overdue = (now - payment.deadline).days
+            user_parcels = payment.user.parcels.all()
+            parcels_data = [
+                {
+                    'parcel_ref': p.parcel_ref,
+                    'ward': p.ward,
+                    'sub_county': p.sub_county,
+                    'county': p.county,
+                    'centroid': {
+                        'lat': p.centroid.y,
+                        'lon': p.centroid.x
+                    } if p.centroid else None
+                }
+                for p in user_parcels
+            ]
+            
+            results.append({
+                'user_id': payment.user.user_id,
+                'username': payment.user.username,
+                'email': payment.user.email,
+                'phone': payment.user.phone,
+                'payment_id': payment.payment_id,
+                'amount': payment.amount,
+                'currency': payment.currency,
+                'deadline': payment.deadline,
+                'days_overdue': days_overdue,
+                'status': payment.status,
+                'created_at': payment.created_at,
+                'metadata': payment.metadata,
+                'parcels': parcels_data
+            })
+            
+        serializer = DefaulterSerializer(results, many=True)
+        return Response(serializer.data)
+
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List audit logs",
+        description="Get a paginated list of audit log entries. Admin/Auditor only.",
+        tags=['Audit'],
+    ),
+    retrieve=extend_schema(
+        summary="Get audit log entry",
+        description="Retrieve details of a specific audit log entry. Admin/Auditor only.",
+        tags=['Audit'],
+    ),
+)
+class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only ViewSet for viewing audit logs. Admin/Auditor access only.
+    """
+    queryset = AuditLog.objects.select_related('who').all()
     serializer_class = AuditLogSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['who', 'action', 'object_type']
