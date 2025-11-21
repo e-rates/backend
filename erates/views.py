@@ -1424,7 +1424,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             'status': payment.status
         })
     
-       @extend_schema(
+    @extend_schema(
         summary="Get list of defaulters",
         description="Retrieve users with overdue payments. Supports filtering by location, amount, and days overdue.",
         tags=['Payments'],
