@@ -1410,22 +1410,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
             return Response(
                 {'error': 'Can only refund completed payments'},
                 status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        payment.status = 'refunded'
-        payment.save()
-        
-        return Response({
-        summary="List audit logs",
-        description="Get a paginated list of audit log entries. Admin/Auditor only.",
-        tags=['Audit'],
-    ),
-    retrieve=extend_schema(
-        summary="Get audit log entry",
-        description="Retrieve details of a specific audit log entry. Admin/Auditor only.",
-        tags=['Audit'],
-    ),
-)
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Read-only ViewSet for viewing audit logs. Admin/Auditor access only.
