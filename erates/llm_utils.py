@@ -106,3 +106,4 @@ def query_qwen(user_query, api_url):
             
     except requests.exceptions.RequestException as e:
         return {"error": f"Connection failed: {str(e)}"}
+>>>>>>> 8706e66 (-)

@@ -618,3 +618,4 @@ class LLMQuerySerializer(serializers.Serializer):
     query = serializers.CharField(required=True, help_text="The question to ask the LLM")
     api_url = serializers.URLField(required=False, help_text="Optional override for Colab API URL")
 
+>>>>>>> 8706e66 (-)

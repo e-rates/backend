@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 from django.utils import timezone
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -1356,4 +1357,3 @@ class ReportsViewSet(viewsets.ViewSet):
             writer.writerow(data.keys())
             writer.writerow(data.values())
         
-        return response
