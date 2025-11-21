@@ -12,19 +12,12 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 import os
-os.environ['GDAL_DATA'] = r"D:\projects\e-rates\env\Lib\site-packages\osgeo\data\gdal"
-GDAL_LIBRARY_PATH = r"D:\projects\e-rates\env\Lib\site-packages\osgeo\gdal.dll"
-
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-GDAL_LIBRARY_PATH = r"D:\projects\e-rates\env\Lib\site-packages\osgeo\gdal.dll"
-
-
-os.environ['PATH'] += os.pathsep + os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo')
-os.environ['GDAL_LIBRARY_PATH'] = os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo', 'gdal310.dll')
-os.environ['GEOS_LIBRARY_PATH'] = os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo', 'geos_c.dll')
+# GDAL configuration for Linux - let the system handle library paths
+# The system-installed GDAL will be used automatically
 
 
 # Quick-start development settings - unsuitable for production
@@ -45,6 +38,8 @@ ALLOWED_HOSTS = []
 
 # Custom User Model
 AUTH_USER_MODEL = 'erates.User'
+
+APPEND_SLASH = False
 
 
 # Application definition

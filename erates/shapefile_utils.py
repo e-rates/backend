@@ -355,6 +355,9 @@ class ShapefileImporter:
                             parcel_ref=parcel_ref,
                             geom=geos_geom,
                             status=self.status,
+                            county=self.location_metadata.get('county', ''),
+                            sub_county=self.location_metadata.get('sub_county', ''),
+                            ward=self.location_metadata.get('ward', ''),
                             props=props
                         )
                         

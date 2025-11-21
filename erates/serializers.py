@@ -242,7 +242,7 @@ class ParcelSerializer(GeoFeatureModelSerializer):
         id_field = 'parcel_id'
         fields = [
             'parcel_id', 'owner_user', 'owner_username', 'owner_email', 'parcel_ref',
-            'geom', 'centroid', 'area_m2', 'status', 'props',
+            'geom', 'centroid', 'area_m2', 'status', 'county', 'sub_county', 'ward', 'props',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
@@ -283,7 +283,7 @@ class ParcelListSerializer(serializers.ModelSerializer):
         model = Parcel
         fields = [
             'parcel_id', 'owner_id', 'owner_username', 'parcel_ref',
-            'area_m2', 'status'
+            'area_m2', 'status', 'county', 'sub_county', 'ward'
         ]
         read_only_fields = fields
 

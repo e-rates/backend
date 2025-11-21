@@ -226,6 +226,11 @@ class Parcel(SecurityMixin):
         default='active'
     )
     
+    # Location fields
+    county = models.CharField(max_length=100, db_index=True)
+    sub_county = models.CharField(max_length=100, db_index=True)
+    ward = models.CharField(max_length=100, blank=True, null=True, db_index=True)
+    
     props = models.JSONField(blank=True, null=True)
     
     class Meta:

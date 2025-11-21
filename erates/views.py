@@ -669,6 +669,204 @@ class ParcelViewSet(viewsets.ModelViewSet):
         })
     
     @extend_schema(
+        summary="Get available parcels for allocation",
+        description="Retrieve list of unassigned parcels with their parcel numbers. Used for parcel allocation UI.",
+        tags=['Parcels'],
+        parameters=[
+            OpenApiParameter(name='county', type=str, description='Filter by county'),
+            OpenApiParameter(name='sub_county', type=str, description='Filter by sub-county'),
+            OpenApiParameter(name='ward', type=str, description='Filter by ward'),
+            OpenApiParameter(name='search', type=str, description='Search by parcel reference'),
+        ],
+        responses={
+            200: inline_serializer(
+                name='AvailableParcelsResponse',
+                fields={
+                    'parcels': drf_serializers.ListField(
+                        child=drf_serializers.DictField()
+                    )
+                }
+            )
+        },
+    )
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminOrAuditor])
+    def available_for_allocation(self, request):
+        """Get list of parcels available for allocation (unassigned)"""
+        parcels = Parcel.objects.filter(owner_user__isnull=True, is_deleted=False)
+        
+        # Apply filters
+        county = request.query_params.get('county')
+        if county:
+            parcels = parcels.filter(county=county)
+        
+        sub_county = request.query_params.get('sub_county')
+        if sub_county:
+            parcels = parcels.filter(sub_county=sub_county)
+        
+        ward = request.query_params.get('ward')
+        if ward:
+            parcels = parcels.filter(ward=ward)
+        
+        search = request.query_params.get('search')
+        if search:
+            parcels = parcels.filter(parcel_ref__icontains=search)
+        
+        # Limit to 100 results for performance
+        parcels = parcels.order_by('parcel_ref')[:100]
+        
+        parcel_list = [
+            {
+                'parcel_id': str(p.parcel_id),
+                'parcel_ref': p.parcel_ref,
+                'county': p.county,
+                'sub_county': p.sub_county,
+                'ward': p.ward,
+                'area_m2': p.area_m2,
+            }
+            for p in parcels
+        ]
+        
+        return Response({'parcels': parcel_list})
+    
+    @extend_schema(
+        summary="Get available users for parcel allocation",
+        description="Retrieve list of active users that can be assigned parcels.",
+        tags=['Parcels'],
+        parameters=[
+            OpenApiParameter(name='search', type=str, description='Search by username, email, or phone'),
+        ],
+        responses={
+            200: inline_serializer(
+                name='AvailableUsersResponse',
+                fields={
+                    'users': drf_serializers.ListField(
+                        child=drf_serializers.DictField()
+                    )
+                }
+            )
+        },
+    )
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminOrAuditor])
+    def available_users(self, request):
+        """Get list of users available for parcel allocation"""
+        users = User.objects.filter(is_active=True, is_deleted=False)
+        
+        search = request.query_params.get('search')
+        if search:
+            users = users.filter(
+                Q(username__icontains=search) |
+                Q(email__icontains=search) |
+                Q(phone__icontains=search)
+            )
+        
+        # Limit to 50 results for performance
+        users = users.order_by('username')[:50]
+        
+        user_list = [
+            {
+                'user_id': str(u.user_id),
+                'username': u.username,
+                'email': u.email,
+                'phone': u.phone,
+                'national_id': u.national_id,
+            }
+            for u in users
+        ]
+        
+        return Response({'users': user_list})
+    
+    @extend_schema(
+        summary="Allocate parcel to user",
+        description="Assign a parcel to a user. Ensures parcel is not already assigned.",
+        tags=['Parcels'],
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'parcel_id': {'type': 'string', 'format': 'uuid', 'description': 'UUID of the parcel'},
+                    'user_id': {'type': 'string', 'format': 'uuid', 'description': 'UUID of the user'}
+                },
+                'required': ['parcel_id', 'user_id']
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Parcel allocated successfully"),
+            400: OpenApiResponse(description="Parcel already assigned or invalid data"),
+            404: OpenApiResponse(description="Parcel or user not found"),
+        },
+    )
+    @action(detail=False, methods=['post'], permission_classes=[IsAdminOrAuditor])
+    def allocate_parcel(self, request):
+        """Allocate a parcel to a user"""
+        parcel_id = request.data.get('parcel_id')
+        user_id = request.data.get('user_id')
+        
+        if not parcel_id or not user_id:
+            return Response(
+                {'error': 'Both parcel_id and user_id are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            parcel = Parcel.objects.get(parcel_id=parcel_id, is_deleted=False)
+            
+            # Check if parcel is already assigned
+            if parcel.owner_user is not None:
+                return Response(
+                    {
+                        'error': 'Parcel is already assigned',
+                        'assigned_to': parcel.owner_user.username,
+                        'parcel_ref': parcel.parcel_ref
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            user = User.objects.get(user_id=user_id, is_active=True, is_deleted=False)
+            
+            # Assign the parcel
+            parcel.owner_user = user
+            parcel.status = 'active'
+            parcel.save()
+            
+            # Create history record
+            ParcelHistory.objects.create(
+                parcel=parcel,
+                owner_user=user,
+                geom=parcel.geom,
+                area_m2=parcel.area_m2,
+                changed_by=request.user,
+                change_reason=f'Parcel allocated to {user.username} by {request.user.username}'
+            )
+            
+            return Response({
+                'success': True,
+                'message': 'Parcel allocated successfully',
+                'parcel_id': str(parcel.parcel_id),
+                'parcel_ref': parcel.parcel_ref,
+                'allocated_to': {
+                    'user_id': str(user.user_id),
+                    'username': user.username,
+                    'email': user.email
+                }
+            })
+            
+        except Parcel.DoesNotExist:
+            return Response(
+                {'error': 'Parcel not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found or inactive'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to allocate parcel: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @extend_schema(
         summary="Get unassigned parcels",
         description="Retrieve all parcels that don't have an owner assigned yet.",
         tags=['Parcels'],
