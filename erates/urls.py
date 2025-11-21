@@ -36,4 +36,3 @@ urlpatterns = [
     path('admin/', include(admin_router.urls)),  # Add /admin/ prefix for frontend
     path('llm/analyze/', LLMQueryView.as_view(), name='llm-analyze'),
 ]
->>>>>>> 8706e66 (-)

@@ -1,4 +1,10 @@
-<<<<<<< HEAD
+from rest_framework import viewsets, permissions, status, filters
+from rest_framework.views import APIView
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from django_filters.rest_framework import DjangoFilterBackend
+from django.db.models import Sum, Count, Avg, Q, F, Max, Min
+from django.db.models.functions import TruncDate, TruncMonth, TruncWeek
 from django.utils import timezone
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -56,6 +62,9 @@ from .serializers import (
     PaymentReportSerializer,
     ParcelReportSerializer,
     LedgerReportSerializer,
+    LLMQuerySerializer,
+)
+from .llm_utils import query_qwen
                 {'error': 'Both parcel_id and user_id are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
@@ -1357,3 +1366,42 @@ class ReportsViewSet(viewsets.ViewSet):
             writer.writerow(data.keys())
             writer.writerow(data.values())
         
+
+class LLMQueryView(APIView):
+    """
+    View to handle queries to the Qwen LLM.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = LLMQuerySerializer
+
+    @extend_schema(
+        summary="Query Qwen LLM",
+        description="Send a natural language query to the Qwen LLM with system context.",
+        tags=['LLM'],
+        request=LLMQuerySerializer,
+        responses={
+            200: OpenApiResponse(description="LLM Analysis Response"),
+            400: OpenApiResponse(description="Invalid request"),
+            500: OpenApiResponse(description="LLM API Error"),
+        },
+    )
+    def post(self, request):
+        serializer = self.serializer_class(data=request.data)
+        if serializer.is_valid():
+            query = serializer.validated_data['query']
+            api_url = serializer.validated_data.get('api_url')
+            
+            if not api_url:
+                 return Response(
+                    {"error": "QWEN_API_URL not provided in request or environment"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            result = query_qwen(query, api_url)
+            
+            if "error" in result:
+                return Response(result, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            return Response(result)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
