@@ -603,6 +603,7 @@ class DefaulterSerializer(serializers.Serializer):
 
 
 
+
 class DefaultersSummarySerializer(serializers.Serializer):
     """Summary statistics for defaulters"""
     total_defaulters = serializers.IntegerField()
@@ -610,4 +611,10 @@ class DefaultersSummarySerializer(serializers.Serializer):
     average_days_overdue = serializers.FloatField()
     defaulters_by_currency = serializers.DictField()
     defaulters = serializers.ListField(child=DefaulterSerializer())
+
+
+class LLMQuerySerializer(serializers.Serializer):
+    """Serializer for LLM queries"""
+    query = serializers.CharField(required=True, help_text="The question to ask the LLM")
+    api_url = serializers.URLField(required=False, help_text="Optional override for Colab API URL")
 

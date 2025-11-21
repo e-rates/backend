@@ -10,6 +10,7 @@ from .views import (
     PaymentViewSet,
     AuditLogViewSet,
     ReportsViewSet,
+    LLMQueryView,
 )
 
 router = DefaultRouter()
@@ -33,4 +34,5 @@ admin_router.register(r'reports', ReportsViewSet, basename='admin-reports')
 urlpatterns = [
     path('', include(router.urls)),
     path('admin/', include(admin_router.urls)),  # Add /admin/ prefix for frontend
+    path('llm/analyze/', LLMQueryView.as_view(), name='llm-analyze'),
 ]
