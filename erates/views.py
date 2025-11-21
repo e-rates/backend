@@ -1402,19 +1402,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
         },
     )
     @action(detail=True, methods=['post'], permission_classes=[IsAdminOrAuditor])
-    def refund(self, request, pk=None):
-        """Refund payment (admin only)"""
-        payment = self.get_object()
-        
-        if payment.status != 'completed':
-            return Response(
-                {'error': 'Can only refund completed payments'},
-                status=status.HTTP_400_BAD_REQUEST
-class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Read-only ViewSet for viewing audit logs. Admin/Auditor access only.
-    """
-    queryset = AuditLog.objects.select_related('who').all()
     serializer_class = AuditLogSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['who', 'action', 'object_type']
