@@ -2,7 +2,8 @@
 Shapefile validation utilities for detecting and reporting common issues.
 """
 from django.contrib.gis.geos import GEOSGeometry
-from typing import Dict, List, Tuple
+from django.contrib.gis.gdal import SpatialReference, CoordTransform
+from typing import Dict, List, Tuple, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -147,3 +148,130 @@ class ShapefileValidator:
             return {
                 'error': str(e)
             }
+    
+    @staticmethod
+    def suggest_epsg_from_extent(extent: Tuple[float, float, float, float], country: str = 'Kenya') -> List[Dict[str, any]]:
+        """
+        Suggest likely EPSG codes based on coordinate extent and country
+        Returns list of suggestions with confidence scores
+        """
+        xmin, ymin, xmax, ymax = extent
+        suggestions = []
+        
+        # Check if already in WGS84 range
+        if -180 <= xmin <= 180 and -180 <= xmax <= 180 and -90 <= ymin <= 90 and -90 <= ymax <= 90:
+            suggestions.append({
+                'epsg': 4326,
+                'name': 'WGS 84 (Geographic)',
+                'confidence': 'high',
+                'reason': 'Coordinates within valid WGS84 range'
+            })
+            return suggestions
+        
+        # Kenya-specific projections
+        if country.lower() == 'kenya':
+            # Check if coordinates look like Kenya Arc 1960 UTM zones
+            if 100000 <= xmin <= 900000 and 9800000 <= ymin <= 10500000:
+                suggestions.append({
+                    'epsg': 21037,
+                    'name': 'Arc 1960 / UTM zone 37S (Kenya)',
+                    'confidence': 'high',
+                    'reason': 'Coordinates match Kenya Arc 1960 UTM 37S range'
+                })
+                suggestions.append({
+                    'epsg': 32737,
+                    'name': 'WGS 84 / UTM zone 37S',
+                    'confidence': 'medium',
+                    'reason': 'Alternative UTM zone 37S projection'
+                })
+            elif 100000 <= xmin <= 900000 and 9000000 <= ymin <= 10500000:
+                suggestions.append({
+                    'epsg': 21036,
+                    'name': 'Arc 1960 / UTM zone 36S (Kenya)',
+                    'confidence': 'high',
+                    'reason': 'Coordinates match Kenya Arc 1960 UTM 36S range'
+                })
+                suggestions.append({
+                    'epsg': 32736,
+                    'name': 'WGS 84 / UTM zone 36S',
+                    'confidence': 'medium',
+                    'reason': 'Alternative UTM zone 36S projection'
+                })
+        
+        # General UTM detection (Southern Hemisphere)
+        if 100000 <= xmin <= 900000 and 1000000 <= ymin <= 10000000:
+            suggestions.append({
+                'epsg': None,
+                'name': 'Likely UTM Southern Hemisphere',
+                'confidence': 'medium',
+                'reason': 'Coordinates match UTM projection pattern. Specify exact zone.'
+            })
+        
+        # Web Mercator
+        if 1000000 <= abs(xmin) <= 20000000 and 1000000 <= abs(ymin) <= 20000000:
+            suggestions.append({
+                'epsg': 3857,
+                'name': 'WGS 84 / Pseudo-Mercator (Web Mercator)',
+                'confidence': 'low',
+                'reason': 'Coordinates in Web Mercator range (used by Google Maps, OpenStreetMap)'
+            })
+        
+        return suggestions if suggestions else [{
+            'epsg': None,
+            'name': 'Unknown',
+            'confidence': 'none',
+            'reason': 'Could not determine coordinate system from extent'
+        }]
+    
+    @staticmethod
+    def reproject_geometry(geom, source_epsg: int, target_epsg: int = 4326) -> Optional[GEOSGeometry]:
+        """
+        Reproject geometry from source EPSG to target EPSG using pyproj ONLY
+        Avoids GDAL/PROJ database version conflicts by using pyproj directly
+        Returns reprojected GEOSGeometry or None if transformation fails
+        """
+        try:
+            from pyproj import Transformer
+            from shapely.geometry import shape
+            from shapely.ops import transform as shapely_transform
+            import json
+            
+            # Convert to GEOS geometry first if needed
+            if isinstance(geom, GEOSGeometry):
+                geos_geom = geom
+            else:
+                # Convert from GDAL geometry
+                geos_geom = GEOSGeometry(geom.wkt, srid=source_epsg)
+            
+            # If already in target EPSG, no transformation needed
+            if source_epsg == target_epsg:
+                return geos_geom
+            
+            # Use pyproj for transformation (avoids PROJ database version issues)
+            # Create transformer with proper datum shift handling
+            # always_xy=True ensures lon,lat order (x=lon, y=lat)
+            transformer = Transformer.from_crs(
+                f"EPSG:{source_epsg}",
+                f"EPSG:{target_epsg}",
+                always_xy=True
+            )
+            
+            # Convert GEOS to shapely for transformation
+            geom_json = json.loads(geos_geom.json)
+            shapely_geom = shape(geom_json)
+            
+            # Transform using pyproj
+            transformed_geom = shapely_transform(transformer.transform, shapely_geom)
+            
+            # Convert back to GEOS
+            transformed_wkt = transformed_geom.wkt
+            result_geom = GEOSGeometry(transformed_wkt, srid=target_epsg)
+            
+            return result_geom
+            
+        except ImportError as ie:
+            logger.error(f"pyproj or shapely not available: {ie}")
+            return None
+        except Exception as e:
+            logger.error(f"Reprojection failed from EPSG:{source_epsg} to EPSG:{target_epsg}: {e}")
+            return None

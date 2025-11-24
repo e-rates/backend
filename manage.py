@@ -3,6 +3,15 @@
 import os
 import sys
 
+# Fix GDAL/PROJ database version mismatch - use OSGEO's proj.db
+# This prevents errors from PostgreSQL's outdated proj.db being loaded
+if 'PROJ_LIB' not in os.environ:
+    import pathlib
+    site_packages = pathlib.Path(__file__).parent / 'env' / 'Lib' / 'site-packages'
+    proj_lib = site_packages / 'osgeo' / 'data' / 'proj'
+    if proj_lib.exists():
+        os.environ['PROJ_LIB'] = str(proj_lib)
+
 
 def main():
     """Run administrative tasks."""

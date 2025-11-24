@@ -241,9 +241,7 @@ class Parcel(SecurityMixin):
         
         if self.geom:
             try:
-                # Check if coordinates are within valid WGS84 range
-                # Longitude: -180 to 180, Latitude: -90 to 90
-                extent = self.geom.extent  # Returns (xmin, ymin, xmax, ymax)
+                extent = self.geom.extent  
                 
                 if extent[0] < -180 or extent[2] > 180:
                     raise ValidationError(
@@ -262,38 +260,24 @@ class Parcel(SecurityMixin):
     def save(self, *args, **kwargs):
         """Auto-calculate centroid and area if not provided"""
         if self.geom:
-            # Ensure geometry has SRID set
             if not self.geom.srid:
                 self.geom.srid = 4326
-            
-            # Calculate centroid
             if not self.centroid:
                 try:
                     self.centroid = self.geom.centroid
                 except Exception:
                     self.centroid = None
-            
-            # Calculate area - use geodetic calculation for WGS84
             if not self.area_m2:
                 try:
                     if self.geom.srid == 4326:
-                        # For WGS84 (lat/lon), use geodetic area calculation
-                        # This is more accurate than transforming to Web Mercator
                         from django.contrib.gis.geos import fromstr
-                        # Use the geometry's native area method which handles geodetic
                         self.area_m2 = self.geom.area
                         
-                        # If area is very small (likely in degrees), convert
                         if self.area_m2 < 1:
-                            # Rough conversion: 1 degree² ≈ 12,400 km² at equator
-                            # For more accurate, we'd need the centroid latitude
-                            # But for now, just flag that this needs attention
                             pass
                     else:
-                        # For projected coordinates, direct area is in map units
                         self.area_m2 = self.geom.area
                 except Exception:
-                    # Last resort: use raw area value
                     try:
                         self.area_m2 = self.geom.area
                     except Exception:

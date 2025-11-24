@@ -12,19 +12,25 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 import os
-os.environ['GDAL_DATA'] = r"D:\projects\e-rates\env\Lib\site-packages\osgeo\data\gdal"
-GDAL_LIBRARY_PATH = r"D:\projects\e-rates\env\Lib\site-packages\osgeo\gdal.dll"
-
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-GDAL_LIBRARY_PATH = r"D:\projects\e-rates\env\Lib\site-packages\osgeo\gdal.dll"
+# GDAL/GEOS/PROJ Configuration
+# Suppress GDAL/PROJ debug output FIRST (before any GDAL imports)
+os.environ['CPL_DEBUG'] = 'OFF'
+os.environ['CPL_LOG'] = 'OFF'
+os.environ['CPL_CURL_VERBOSE'] = 'OFF'
+os.environ['GDAL_PAM_ENABLED'] = 'NO'
 
-
+# Use OSGEO's PROJ database to avoid version mismatch with PostgreSQL's outdated proj.db
+os.environ['PROJ_LIB'] = os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
+os.environ['GDAL_DATA'] = os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo', 'data', 'gdal')
 os.environ['PATH'] += os.pathsep + os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo')
 os.environ['GDAL_LIBRARY_PATH'] = os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo', 'gdal310.dll')
 os.environ['GEOS_LIBRARY_PATH'] = os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo', 'geos_c.dll')
+
+GDAL_LIBRARY_PATH = os.path.join(BASE_DIR, 'env', 'Lib', 'site-packages', 'osgeo', 'gdal.dll')
 
 
 # Quick-start development settings - unsuitable for production

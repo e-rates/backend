@@ -84,6 +84,30 @@ class ShapefileUploadSerializer(serializers.Serializer):
         return value
 
 
+class EPSGSuggestionSerializer(serializers.Serializer):
+    """Serializer for EPSG code suggestions"""
+    epsg = serializers.IntegerField(allow_null=True)
+    name = serializers.CharField()
+    confidence = serializers.CharField()
+    reason = serializers.CharField()
+
+
+class ShapefileInfoSerializer(serializers.Serializer):
+    """Serializer for shapefile information"""
+    layer_name = serializers.CharField()
+    feature_count = serializers.IntegerField()
+    geometry_type = serializers.CharField()
+    srid = serializers.IntegerField(allow_null=True)
+    coordinate_system_type = serializers.CharField()
+    fields = serializers.ListField(child=serializers.CharField())
+    extent = serializers.ListField(
+        child=serializers.FloatField(),
+        required=False
+    )
+    epsg_suggestions = EPSGSuggestionSerializer(many=True, required=False)
+    needs_manual_epsg = serializers.BooleanField(required=False)
+
+
 class ShapefileImportResultSerializer(serializers.Serializer):
     """Serializer for import results"""
     
@@ -101,4 +125,4 @@ class ShapefileImportResultSerializer(serializers.Serializer):
         child=serializers.CharField(),
         required=False
     )
-    shapefile_info = serializers.DictField(required=False)
+    shapefile_info = ShapefileInfoSerializer(required=False)

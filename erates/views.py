@@ -235,6 +235,35 @@ class UserViewSet(viewsets.ModelViewSet):
             serializer.save()
             return Response({'message': 'Password changed successfully'})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @extend_schema(
+        summary="Search users by username",
+        description="Search for users by username. Admin/Auditor only.",
+        tags=['Users'],
+        parameters=[
+            OpenApiParameter('search', OpenApiTypes.STR, description='Username to search for'),
+        ],
+        responses={200: UserListSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], permission_classes=[permissions.IsAuthenticated, IsAdminOrAuditor], url_path='search_users')
+    def search_users(self, request):
+        """Search for users by username"""
+        search_term = request.query_params.get('search', '').strip()
+        
+        if not search_term:
+            return Response(
+                {'error': 'search parameter is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Search users by username
+        users = User.objects.filter(
+            is_deleted=False,
+            username__icontains=search_term
+        ).order_by('username')[:20]  # Limit results
+        
+        serializer = UserListSerializer(users, many=True, context={'request': request})
+        return Response(serializer.data)
 
 
 
@@ -701,6 +730,140 @@ class ParcelViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
     @extend_schema(
+        summary="Search parcels available for allocation",
+        description="Search for parcels that can be allocated to users. Searches by parcel reference number.",
+        tags=['Parcels'],
+        parameters=[
+            OpenApiParameter('search', OpenApiTypes.STR, description='Parcel reference to search for'),
+        ],
+        responses={200: ParcelListSerializer(many=True)},
+    )
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminOrAuditor], url_path='available_for_allocation')
+    def available_for_allocation(self, request):
+        """Search for parcels available for allocation (unassigned or active parcels)"""
+        search_term = request.query_params.get('search', '').strip()
+        
+        if not search_term:
+            return Response(
+                {'error': 'search parameter is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Search parcels by reference - include both unassigned and already assigned
+        # (admin might want to see existing allocations)
+        parcels = Parcel.objects.filter(
+            is_deleted=False,
+            parcel_ref__icontains=search_term
+        ).select_related('owner_user').order_by('parcel_ref')[:20]  # Limit results
+        
+        # Serialize
+        serializer = ParcelListSerializer(parcels, many=True, context={'request': request})
+        return Response(serializer.data)
+    
+    @extend_schema(
+        summary="Allocate parcel to user",
+        description="Allocate a specific parcel to a user. Creates history record.",
+        tags=['Parcels'],
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'parcel_id': {'type': 'string', 'format': 'uuid', 'description': 'UUID of the parcel to allocate'},
+                    'user_id': {'type': 'string', 'format': 'uuid', 'description': 'UUID of the user to allocate to'}
+                },
+                'required': ['parcel_id', 'user_id']
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Parcel allocated successfully"),
+            400: OpenApiResponse(description="Invalid request data"),
+            404: OpenApiResponse(description="Parcel or user not found"),
+        },
+    )
+    @action(detail=False, methods=['post'], permission_classes=[IsAdminOrAuditor], url_path='allocate_parcel')
+    def allocate_parcel(self, request):
+        """Allocate a parcel to a user"""
+        # Support multiple field name variations from frontend
+        parcel_id = (
+            request.data.get('parcel_id') or 
+            request.data.get('parcelId') or 
+            request.data.get('parcel')
+        )
+        user_id = (
+            request.data.get('user_id') or 
+            request.data.get('userId') or 
+            request.data.get('user')
+        )
+        
+        # Log received data for debugging
+        print(f"Received allocation request - parcel_id: {parcel_id}, user_id: {user_id}")
+        print(f"Full request data: {request.data}")
+        
+        if not parcel_id or not user_id:
+            return Response(
+                {
+                    'error': 'parcel_id and user_id are required',
+                    'received_data': {
+                        'parcel_id': parcel_id,
+                        'user_id': user_id,
+                        'all_keys': list(request.data.keys()),
+                        'full_data': request.data
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            parcel = Parcel.objects.get(parcel_id=parcel_id, is_deleted=False)
+            user = User.objects.get(user_id=user_id, is_deleted=False)
+            
+            # Store old owner for history
+            old_owner = parcel.owner_user
+            
+            # Assign new owner
+            parcel.owner_user = user
+            parcel.status = 'transferred' if old_owner else 'active'
+            parcel.save()
+            
+            # Create history record
+            ParcelHistory.objects.create(
+                parcel=parcel,
+                owner_user=user,
+                geom=parcel.geom,
+                area_m2=parcel.area_m2,
+                changed_by=request.user,
+                change_reason=f'Parcel allocated to {user.username} by {request.user.username}'
+            )
+            
+            return Response({
+                'success': True,
+                'message': f'Parcel {parcel.parcel_ref} allocated to {user.username}',
+                'parcel': {
+                    'parcel_id': str(parcel.parcel_id),
+                    'parcel_ref': parcel.parcel_ref,
+                    'previous_owner': old_owner.username if old_owner else None,
+                    'new_owner': user.username,
+                    'status': parcel.status
+                }
+            })
+            
+        except Parcel.DoesNotExist:
+            return Response(
+                {'error': 'Parcel not found or has been deleted'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found or has been deleted'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to allocate parcel: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @extend_schema(
         summary="Transfer parcel ownership (Legacy)",
         description="Transfer ownership of a parcel to another user. Creates a history record. Use assign_owner instead.",
         tags=['Parcels'],
@@ -874,20 +1037,6 @@ class ParcelViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['post'], permission_classes=[IsAdminOrAuditor])
     def upload_shapefile(self, request):
-        """
-        Upload and import parcels from a ZIP file containing shapefile.
-        
-        The ZIP file should contain at minimum:
-        - .shp file (required)
-        - .shx file (required)
-        - .dbf file (required)
-        - .prj file (recommended for coordinate system info)
-        
-        If shapefile is missing .prj file or has coordinate system issues:
-        - Provide source_epsg parameter (e.g., 21037 for Kenya Arc 1960 UTM 37S)
-        - Common Kenya EPSG codes: 21037, 32737 (UTM), 4326 (WGS84 Lat/Long)
-        - Set auto_generate_ref=true to auto-generate missing parcel numbers
-        """
         serializer = ShapefileUploadSerializer(data=request.data)
         
         if not serializer.is_valid():

@@ -1,12 +1,24 @@
 """
 Utility functions for shapefile upload and import.
 """
+import os
+import sys
+import warnings
+
+# Suppress GDAL/PROJ warnings and errors BEFORE importing GDAL
+os.environ['CPL_DEBUG'] = 'OFF'
+os.environ['CPL_LOG'] = 'OFF'
+os.environ['GDAL_DATA'] = os.path.join(os.path.dirname(__file__), '..', 'env', 'Lib', 'site-packages', 'osgeo', 'data', 'gdal')
+
+# Suppress Python warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+
 from django.contrib.gis.gdal import DataSource
 from django.contrib.gis.geos import GEOSGeometry, MultiPolygon, Polygon
 from django.db import transaction
 from erates.models import User, Parcel
 from erates.shapefile_validator import ShapefileValidator
-import os
 import zipfile
 import tempfile
 import shutil
@@ -70,11 +82,13 @@ class ShapefileImporter:
             raise ValueError(f"Error extracting ZIP: {str(e)}")
     
     def get_shapefile_info(self) -> Dict:
-        """Get information about the shapefile"""
+        """Get information about the shapefile with EPSG suggestions"""
         if not self.shapefile_path:
             raise ValueError("Shapefile not extracted yet")
         
         try:
+            from erates.shapefile_validator import ShapefileValidator
+            
             ds = DataSource(self.shapefile_path)
             layer = ds[0]
             
@@ -84,6 +98,8 @@ class ShapefileImporter:
             
             # Detect coordinate system type
             cs_type = "Unknown"
+            epsg_suggestions = []
+            
             if extent:
                 xmin, ymin, xmax, ymax = extent
                 if -180 <= xmin <= 180 and -180 <= xmax <= 180 and -90 <= ymin <= 90 and -90 <= ymax <= 90:
@@ -92,6 +108,10 @@ class ShapefileImporter:
                     cs_type = "Projected (UTM or local grid)"
                 elif 1000000 <= abs(xmin):
                     cs_type = "Projected (Web Mercator or similar)"
+                
+                # Get EPSG suggestions if no .prj or if not WGS84
+                if not srid or srid != 4326:
+                    epsg_suggestions = ShapefileValidator.suggest_epsg_from_extent(extent, country='Kenya')
             
             return {
                 'layer_name': layer.name,
@@ -101,6 +121,8 @@ class ShapefileImporter:
                 'coordinate_system_type': cs_type,
                 'fields': list(layer.fields),
                 'extent': extent,
+                'epsg_suggestions': epsg_suggestions,
+                'needs_manual_epsg': not srid or (srid and srid != 4326 and cs_type == "Unknown"),
             }
         except Exception as e:
             raise ValueError(f"Error reading shapefile: {str(e)}")
@@ -148,12 +170,21 @@ class ShapefileImporter:
                 # Check if coordinates look like they're in a projected system
                 if not (-180 <= xmin <= 180 and -180 <= xmax <= 180 and -90 <= ymin <= 90 and -90 <= ymax <= 90):
                     source_srid = layer.srs.srid if layer.srs else None
-                    if not source_srid or source_srid == 4326:
+                    
+                    # Only raise error if BOTH conditions are true:
+                    # 1. No .prj file (source_srid is None) OR .prj says WGS84 (which is wrong)
+                    # 2. User didn't provide manual source_epsg override
+                    if (not source_srid or source_srid == 4326) and not self.source_epsg:
+                        from erates.shapefile_validator import ShapefileValidator
+                        suggestions = ShapefileValidator.suggest_epsg_from_extent(extent, country='Kenya')
+                        suggested_epsg = suggestions[0]['epsg'] if suggestions and suggestions[0]['epsg'] else 'unknown'
+                        
                         raise ValueError(
                             f"Shapefile coordinates appear to be in a projected coordinate system "
                             f"(extent: {xmin:.2f}, {ymin:.2f}, {xmax:.2f}, {ymax:.2f}), "
                             f"but no valid coordinate system is defined in the .prj file. "
-                            f"Please ensure your shapefile includes a proper .prj file with coordinate system information."
+                            f"Suggested EPSG: {suggested_epsg}. "
+                            f"Please provide the 'source_epsg' parameter with the correct EPSG code."
                         )
         except ValueError:
             raise
@@ -245,31 +276,35 @@ class ShapefileImporter:
                         # Get source SRID from layer or use manual override
                         source_srid = self.source_epsg if self.source_epsg else (layer.srs.srid if layer.srs else None)
                         
-                        # Convert to GEOS geometry with proper SRID handling
+                        # Convert to GEOS geometry with intelligent reprojection
                         try:
+                            from erates.shapefile_validator import ShapefileValidator
+                            
                             if source_srid and source_srid != 4326:
-                                # Has SRID and it's not WGS84, need transformation
-                                geos_geom = GEOSGeometry(geom.wkt, srid=source_srid)
-                                try:
-                                    geos_geom.transform(4326)
-                                except Exception as transform_error:
+                                # Has SRID and it's not WGS84, use GeoDjango's reprojection
+                                geos_geom = ShapefileValidator.reproject_geometry(geom, source_srid, 4326)
+                                if not geos_geom:
                                     self.skipped += 1
-                                    self.errors.append(f'• {idx}: Cannot transform from SRID {source_srid} to WGS84 (Parcel: {parcel_ref})')
+                                    self.errors.append(f'• {idx}: Cannot transform from EPSG:{source_srid} to WGS84 (Parcel: {parcel_ref})')
                                     continue
                             else:
                                 # No SRID or already WGS84
                                 geos_geom = GEOSGeometry(geom.wkt, srid=4326)
                                 
-                                # If no SRID was declared, check if coordinates look like they need transformation
+                                # If no SRID was declared, validate coordinates and suggest EPSG
                                 if not source_srid:
                                     extent = geos_geom.extent
                                     # Check if coordinates are outside WGS84 range
                                     if not (-180 <= extent[0] <= 180 and -180 <= extent[2] <= 180 and
                                            -90 <= extent[1] <= 90 and -90 <= extent[3] <= 90):
+                                        # Get EPSG suggestions
+                                        suggestions = ShapefileValidator.suggest_epsg_from_extent(extent, country='Kenya')
+                                        epsg_hint = suggestions[0]['epsg'] if suggestions and suggestions[0]['epsg'] else 'unknown'
                                         self.skipped += 1
                                         self.errors.append(
                                             f'• {idx}: Coordinates out of valid WGS84 range (Parcel: {parcel_ref}). '
-                                            f'Shapefile missing .prj file or has invalid coordinate system.'
+                                            f'Shapefile missing .prj file. Suggested EPSG: {epsg_hint}. '
+                                            f'Use source_epsg parameter to specify.'
                                         )
                                         continue
                         except Exception as e:
