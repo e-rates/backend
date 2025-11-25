@@ -281,11 +281,22 @@ class ShapefileImporter:
                             from erates.shapefile_validator import ShapefileValidator
                             
                             if source_srid and source_srid != 4326:
-                                # Has SRID and it's not WGS84, use GeoDjango's reprojection
+                                # Has SRID and it's not WGS84, use pyproj reprojection for accuracy
                                 geos_geom = ShapefileValidator.reproject_geometry(geom, source_srid, 4326)
                                 if not geos_geom:
                                     self.skipped += 1
                                     self.errors.append(f'• {idx}: Cannot transform from EPSG:{source_srid} to WGS84 (Parcel: {parcel_ref})')
+                                    continue
+                                
+                                # Validate transformed geometry is within WGS84 bounds
+                                extent = geos_geom.extent
+                                if not (-180 <= extent[0] <= 180 and -180 <= extent[2] <= 180 and
+                                        -90 <= extent[1] <= 90 and -90 <= extent[3] <= 90):
+                                    self.skipped += 1
+                                    self.errors.append(
+                                        f'• {idx}: Transformed coordinates out of valid WGS84 range (Parcel: {parcel_ref}). '
+                                        f'Source EPSG:{source_srid} may be incorrect.'
+                                    )
                                     continue
                             else:
                                 # No SRID or already WGS84

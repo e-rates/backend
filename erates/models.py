@@ -269,15 +269,37 @@ class Parcel(SecurityMixin):
                     self.centroid = None
             if not self.area_m2:
                 try:
-                    if self.geom.srid == 4326:
-                        from django.contrib.gis.geos import fromstr
-                        self.area_m2 = self.geom.area
-                        
-                        if self.area_m2 < 1:
-                            pass
+                    # For accurate area calculation in Kenya, transform to appropriate UTM zone
+                    # Kenya spans UTM zones 36N (EPSG:32636) and 37N (EPSG:32637)
+                    from pyproj import Geod
+                    
+                    # Use WGS84 ellipsoid for geodetic area calculation
+                    geod = Geod(ellps='WGS84')
+                    
+                    # Convert geometry to proper format for pyproj
+                    if self.geom.geom_type == 'Polygon':
+                        # Get exterior ring coordinates
+                        coords = list(self.geom.coords[0])
+                        lons = [c[0] for c in coords]
+                        lats = [c[1] for c in coords]
+                        # Calculate geodetic area
+                        area, _ = geod.polygon_area_perimeter(lons, lats)
+                        self.area_m2 = abs(area)  # Make positive
+                    elif self.geom.geom_type == 'MultiPolygon':
+                        total_area = 0
+                        for polygon in self.geom:
+                            coords = list(polygon.coords[0])
+                            lons = [c[0] for c in coords]
+                            lats = [c[1] for c in coords]
+                            area, _ = geod.polygon_area_perimeter(lons, lats)
+                            total_area += abs(area)
+                        self.area_m2 = total_area
                     else:
+                        # Fallback to simple area calculation
                         self.area_m2 = self.geom.area
-                except Exception:
+                except Exception as e:
+                    # If geodetic calculation fails, use Django's default area
+                    # (less accurate but better than nothing)
                     try:
                         self.area_m2 = self.geom.area
                     except Exception:

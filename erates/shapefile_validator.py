@@ -13,6 +13,56 @@ class ShapefileValidator:
     """Validate and provide detailed feedback on shapefile data"""
     
     @staticmethod
+    def validate_projection_accuracy(geom: GEOSGeometry, source_epsg: int, target_epsg: int = 4326) -> Dict:
+        """
+        Validate that a geometry's projection transformation appears accurate.
+        Returns dict with validation status and details.
+        """
+        try:
+            from pyproj import CRS, Transformer
+            
+            # Get CRS information
+            source_crs = CRS.from_epsg(source_epsg)
+            target_crs = CRS.from_epsg(target_epsg)
+            
+            # Check if transformation is appropriate
+            is_geographic_to_projected = source_crs.is_geographic and target_crs.is_projected
+            is_projected_to_geographic = source_crs.is_projected and target_crs.is_geographic
+            
+            # Get geometry extent
+            extent = geom.extent  # (xmin, ymin, xmax, ymax)
+            
+            # Validate based on CRS types
+            issues = []
+            
+            if target_epsg == 4326:  # Target is WGS84
+                # Check bounds
+                if extent[0] < -180 or extent[2] > 180:
+                    issues.append(f"Longitude out of bounds: {extent[0]:.6f} to {extent[2]:.6f}")
+                if extent[1] < -90 or extent[3] > 90:
+                    issues.append(f"Latitude out of bounds: {extent[1]:.6f} to {extent[3]:.6f}")
+                
+                # Check if coordinates look reasonable for Kenya
+                kenya_bounds = (33.0, -5.0, 42.0, 6.0)  # (west, south, east, north)
+                if not (kenya_bounds[0] <= extent[0] <= kenya_bounds[2] and
+                        kenya_bounds[1] <= extent[1] <= kenya_bounds[3]):
+                    issues.append(f"Coordinates outside Kenya bounds. Extent: {extent}")
+            
+            return {
+                'is_valid': len(issues) == 0,
+                'source_crs': source_crs.name,
+                'target_crs': target_crs.name,
+                'extent': extent,
+                'issues': issues
+            }
+            
+        except Exception as e:
+            return {
+                'is_valid': False,
+                'error': str(e)
+            }
+    
+    @staticmethod
     def validate_coordinates(geom: GEOSGeometry, feature_index: int, parcel_ref: str = None) -> Tuple[bool, str]:
         """
         Check if geometry coordinates are within valid WGS84 bounds
@@ -231,7 +281,7 @@ class ShapefileValidator:
         Returns reprojected GEOSGeometry or None if transformation fails
         """
         try:
-            from pyproj import Transformer
+            from pyproj import Transformer, CRS
             from shapely.geometry import shape
             from shapely.ops import transform as shapely_transform
             import json
@@ -247,13 +297,23 @@ class ShapefileValidator:
             if source_epsg == target_epsg:
                 return geos_geom
             
+            # Validate that source and target CRS are valid
+            try:
+                source_crs = CRS.from_epsg(source_epsg)
+                target_crs = CRS.from_epsg(target_epsg)
+            except Exception as e:
+                logger.error(f"Invalid EPSG codes: source={source_epsg}, target={target_epsg}: {e}")
+                return None
+            
             # Use pyproj for transformation (avoids PROJ database version issues)
             # Create transformer with proper datum shift handling
             # always_xy=True ensures lon,lat order (x=lon, y=lat)
+            # Set area_of_interest for Kenya to improve accuracy (Kenya bounds approximately)
             transformer = Transformer.from_crs(
-                f"EPSG:{source_epsg}",
-                f"EPSG:{target_epsg}",
-                always_xy=True
+                source_crs,
+                target_crs,
+                always_xy=True,
+                area_of_interest=(33.0, -5.0, 42.0, 6.0)  # Kenya bounding box (west, south, east, north)
             )
             
             # Convert GEOS to shapely for transformation
@@ -263,9 +323,25 @@ class ShapefileValidator:
             # Transform using pyproj
             transformed_geom = shapely_transform(transformer.transform, shapely_geom)
             
+            # Validate transformed geometry
+            if not transformed_geom.is_valid:
+                # Try to fix with buffer(0)
+                transformed_geom = transformed_geom.buffer(0)
+                if not transformed_geom.is_valid:
+                    logger.error(f"Transformed geometry is invalid after repair")
+                    return None
+            
             # Convert back to GEOS
             transformed_wkt = transformed_geom.wkt
             result_geom = GEOSGeometry(transformed_wkt, srid=target_epsg)
+            
+            # Final validation: check if coordinates are within expected bounds for target CRS
+            if target_epsg == 4326:
+                extent = result_geom.extent
+                if not (-180 <= extent[0] <= 180 and -180 <= extent[2] <= 180 and
+                        -90 <= extent[1] <= 90 and -90 <= extent[3] <= 90):
+                    logger.error(f"Transformed coordinates out of WGS84 bounds: {extent}")
+                    return None
             
             return result_geom
             
