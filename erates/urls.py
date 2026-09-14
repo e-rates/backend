@@ -14,6 +14,7 @@ from .views import (
     CountyViewSet,
     ReportsViewSet,
     LLMQueryView,
+    AIReconciliationView,
 )
 
 router = DefaultRouter()
@@ -41,4 +42,5 @@ urlpatterns = [
     path('admin/', include(admin_router.urls)),  # Add /admin/ prefix for frontend
     path('health/', health, name='health'),
     path('llm/analyze/', LLMQueryView.as_view(), name='llm-analyze'),
+    path('v1/ai/reconcile/', AIReconciliationView.as_view(), name='ai-reconcile'),
 ]
