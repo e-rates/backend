@@ -2,8 +2,6 @@
 Serializers for shapefile upload and import functionality.
 """
 from rest_framework import serializers
-from django.core.files.uploadedfile import UploadedFile
-import os
 
 
 class ShapefileUploadSerializer(serializers.Serializer):
@@ -72,6 +70,19 @@ class ShapefileUploadSerializer(serializers.Serializer):
         help_text="Source EPSG code if shapefile is missing .prj file (e.g., 21037 for Kenya UTM Zone 37S, 32737 for WGS84 UTM Zone 37S)"
     )
     
+    area_name = serializers.CharField(
+        required=False,
+        write_only=True,
+        max_length=100,
+        help_text="Deprecated alias for sub_county"
+    )
+
+    def validate(self, attrs):
+        area_name = attrs.pop('area_name', None)
+        if area_name and not attrs.get('sub_county'):
+            attrs['sub_county'] = area_name
+        return attrs
+
     def validate_zip_file(self, value):
         """Validate that uploaded file is a ZIP"""
         if not value.name.endswith('.zip'):

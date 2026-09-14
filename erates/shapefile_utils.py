@@ -2,16 +2,16 @@
 Utility functions for shapefile upload and import.
 """
 from django.contrib.gis.gdal import DataSource
-from django.contrib.gis.geos import GEOSGeometry, MultiPolygon, Polygon
+from django.contrib.gis.geos import GEOSGeometry
 from django.db import transaction
-from erates.models import User, Parcel
-from erates.shapefile_validator import ShapefileValidator
+from django.db.models import ProtectedError
+from erates.models import Parcel
 import os
 import zipfile
 import tempfile
 import shutil
 import uuid
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 
 
 class ShapefileImporter:
@@ -111,10 +111,25 @@ class ShapefileImporter:
             ds = DataSource(self.shapefile_path)
             layer = ds[0]
             
-            # Check if ref_field exists
+            # Check if ref_field exists (with intelligent auto-detection)
+            fields_lower = {f.lower(): f for f in layer.fields}
             if self.ref_field not in layer.fields:
-                available_fields = ', '.join(layer.fields)
-                return False, f"Field '{self.ref_field}' not found. Available: {available_fields}"
+                # 1. Try case-insensitive match
+                if self.ref_field.lower() in fields_lower:
+                    self.ref_field = fields_lower[self.ref_field.lower()]
+                else:
+                    # 2. Try common parcel identifier aliases
+                    aliases = ['parcel_no', 'parcelno', 'parcel_id', 'plot_no', 'plotno', 'lr_no', 'lrno', 'id', 'pid']
+                    matched = None
+                    for a in aliases:
+                        if a in fields_lower:
+                            matched = fields_lower[a]
+                            break
+                    if matched:
+                        self.ref_field = matched
+                    else:
+                        available_fields = ', '.join(layer.fields)
+                        return False, f"Parcel field '{self.ref_field}' not found. Available fields in your file: {available_fields}. Please select which field contains parcel numbers."
             
             # Check geometry type
             if layer.geom_type.name not in ['Polygon', 'MultiPolygon', 'Polygon25D']:
@@ -160,12 +175,6 @@ class ShapefileImporter:
         except Exception:
             pass  # Continue with import if pre-check fails
         
-        # Clear existing if requested
-        if self.clear_existing:
-            count = Parcel.objects.count()
-            Parcel.objects.all().delete()
-            self.warnings.append(f"Cleared {count} existing parcels")
-        
         try:
             ds = DataSource(self.shapefile_path)
             layer = ds[0]
@@ -204,12 +213,21 @@ class ShapefileImporter:
                 if field in layer.fields:
                     area_ha_field = field
                     break
-            for field in ['AREA_ACRES', 'ACRES']:
+            for field in ['AREA_ACRES', 'AREA_ACRE', 'ACRES']:
                 if field in layer.fields:
                     area_acres_field = field
                     break
             
             with transaction.atomic():
+                if self.clear_existing:
+                    count = Parcel.objects.count()
+                    try:
+                        with transaction.atomic():
+                            Parcel.objects.all().delete()
+                    except ProtectedError:
+                        raise ValueError("Cannot clear existing parcels: some are referenced by history or other records")
+                    self.warnings.append(f"Cleared {count} existing parcels")
+
                 for idx, feature in enumerate(layer, start=1):
                     try:
                         # Get parcel reference
@@ -313,20 +331,14 @@ class ShapefileImporter:
                         # Get area from shapefile if available
                         area_m2 = None
                         try:
-                            if area_field and feature.get(area_field):
-                                area_val = feature.get(area_field)
-                                if area_val and float(area_val) > 0:
-                                    area_m2 = float(area_val)
-                            elif area_ha_field and feature.get(area_ha_field):
-                                area_val = feature.get(area_ha_field)
-                                if area_val and float(area_val) > 0:
-                                    area_m2 = float(area_val) * 10000
-                            elif area_acres_field and feature.get(area_acres_field):
-                                area_val = feature.get(area_acres_field)
-                                if area_val and float(area_val) > 0:
-                                    area_m2 = float(area_val) * 4046.86
+                            if area_ha_field and float(feature.get(area_ha_field) or 0) > 0:
+                                area_m2 = float(feature.get(area_ha_field)) * 10000
+                            elif area_acres_field and float(feature.get(area_acres_field) or 0) > 0:
+                                area_m2 = float(feature.get(area_acres_field)) * 4046.86
+                            elif area_field and float(feature.get(area_field) or 0) >= 1:
+                                area_m2 = float(feature.get(area_field))
                         except (ValueError, TypeError):
-                            area_m2 = None  # Let Django calculate it
+                            area_m2 = None
                         
                         # Extract all properties with encoding handling
                         props = {}
@@ -365,7 +377,8 @@ class ShapefileImporter:
                         if area_m2:
                             parcel.area_m2 = area_m2
                         
-                        parcel.save()
+                        with transaction.atomic():
+                            parcel.save()
                         self.imported += 1
                         
                     except Exception as e:

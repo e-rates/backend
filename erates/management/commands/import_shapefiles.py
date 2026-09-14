@@ -12,7 +12,7 @@ Examples:
 
 from django.core.management.base import BaseCommand, CommandError
 from django.contrib.gis.gdal import DataSource
-from django.contrib.gis.geos import GEOSGeometry, MultiPolygon, Polygon
+from django.contrib.gis.geos import GEOSGeometry, MultiPolygon
 from django.db import transaction
 from erates.models import User, Parcel
 import os
@@ -241,7 +241,8 @@ class Command(BaseCommand):
                     if area_from_shapefile:
                         parcel.area_m2 = area_from_shapefile
                     
-                    parcel.save()
+                    with transaction.atomic():
+                        parcel.save()
 
                     imported += 1
                     

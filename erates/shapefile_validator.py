@@ -2,7 +2,7 @@
 Shapefile validation utilities for detecting and reporting common issues.
 """
 from django.contrib.gis.geos import GEOSGeometry
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 import logging
 
 logger = logging.getLogger(__name__)

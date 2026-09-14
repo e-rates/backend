@@ -1,15 +1,40 @@
+from django.conf import settings
 from django.db import models
 from django.contrib.gis.db import models as gis_models
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
-from django.contrib.auth.hashers import make_password, check_password
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from encrypted_model_fields.fields import EncryptedCharField
+import json
+import re
 import uuid
 import hashlib
 import hmac
 from decimal import Decimal
 from typing import Optional
+
+
+def integrity_hmac(*parts) -> str:
+    message = "|".join(str(p) for p in parts).encode()
+    return hmac.new(settings.SECRET_KEY.encode(), message, hashlib.sha256).hexdigest()
+
+
+def money(value) -> str:
+    return f"{Decimal(value):.2f}"
+
+
+def canonical_phone(value) -> str:
+    digits = re.sub(r'\D', '', value or '')
+    if digits.startswith('0') and len(digits) == 10:
+        return '254' + digits[1:]
+    if len(digits) == 9 and digits[0] in '17':
+        return '254' + digits
+    return digits
+
+
+def phone_lookup_hash(value):
+    canonical = canonical_phone(value)
+    return integrity_hmac('phone', canonical) if canonical else None
 
 
 class SecurityMixin(models.Model):
@@ -63,6 +88,7 @@ class User(AbstractBaseUser, PermissionsMixin, SecurityMixin):
     user_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     national_id = EncryptedCharField(max_length=255, blank=True, null=True)
     phone = EncryptedCharField(max_length=255, blank=True, null=True)
+    phone_hash = models.CharField(max_length=64, blank=True, null=True, unique=True, editable=False)
     username = models.CharField(max_length=150, unique=True, db_index=True)
     email = models.EmailField(unique=True, db_index=True)
     is_verified = models.BooleanField(default=False)
@@ -75,12 +101,16 @@ class User(AbstractBaseUser, PermissionsMixin, SecurityMixin):
     role = models.CharField(
         max_length=50,
         choices=[
-            ('user', 'Regular User'),
-            ('admin', 'Administrator'),
+            ('user', 'Land owner'),
+            ('admin', 'County official'),
             ('auditor', 'Auditor'),
+            ('owner', 'Platform owner'),
         ],
         default='user'
     )
+    county = models.CharField(max_length=100, blank=True, db_index=True,
+                              help_text="County this account belongs to; blank for platform owners")
+    must_change_password = models.BooleanField(default=False)
     
     # Required for AbstractBaseUser
     USERNAME_FIELD = 'username'
@@ -102,6 +132,7 @@ class User(AbstractBaseUser, PermissionsMixin, SecurityMixin):
             raise ValidationError("Password must be at least 8 characters long")
         super().set_password(raw_password)  # Use AbstractBaseUser's set_password
         self.password_changed_at = timezone.now()
+        self.must_change_password = False
 
     def check_password(self, raw_password: str) -> bool:
         """Override to add account locking logic"""
@@ -131,8 +162,49 @@ class User(AbstractBaseUser, PermissionsMixin, SecurityMixin):
             self.save(update_fields=['locked_until', 'failed_login_attempts'])
         return False
     
+    def save(self, *args, **kwargs):
+        self.phone_hash = phone_lookup_hash(self.phone)
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and 'phone' in update_fields:
+            kwargs['update_fields'] = {*update_fields, 'phone_hash'}
+        super().save(*args, **kwargs)
+
+    @property
+    def is_platform_owner(self) -> bool:
+        return self.role == 'owner'
+
+    @property
+    def is_county_staff(self) -> bool:
+        return self.role in ('admin', 'auditor')
+
+    @classmethod
+    def find_by_phone(cls, phone):
+        key = phone_lookup_hash(phone)
+        return cls.objects.filter(phone_hash=key, is_deleted=False).first() if key else None
+
     def __str__(self):
         return self.username
+
+
+class County(models.Model):
+    """A county on the platform: its name, crest and rates office contact."""
+    county_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=100, unique=True)
+    logo = models.ImageField(upload_to='county-logos/', blank=True, null=True)
+    rates_office_email = models.EmailField(blank=True)
+    rates_office_phone = models.CharField(max_length=20, blank=True)
+    paybill = models.CharField(max_length=20, blank=True, help_text="M-Pesa short code rates are paid to")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'counties'
+        ordering = ['name']
+        verbose_name_plural = 'counties'
+
+    def __str__(self):
+        return self.name
 
 
 class Account(SecurityMixin):
@@ -179,13 +251,8 @@ class Account(SecurityMixin):
         ]
     
     def compute_balance_hash(self) -> str:
-        """
-        Compute HMAC-SHA256 hash of balance for integrity verification.
-        Uses account_id as key to ensure uniqueness.
-        """
-        key = str(self.account_id).encode()
-        message = f"{self.current_balance}{self.updated_at}".encode()
-        return hmac.new(key, message, hashlib.sha256).hexdigest()
+        """Compute HMAC-SHA256 of the balance for integrity verification."""
+        return integrity_hmac(self.account_id, money(self.current_balance))
     
     def verify_balance_integrity(self) -> bool:
         """Verify that balance hasn't been tampered with"""
@@ -230,9 +297,26 @@ class Parcel(SecurityMixin):
     county = models.CharField(max_length=100, db_index=True)
     sub_county = models.CharField(max_length=100, db_index=True)
     ward = models.CharField(max_length=100, blank=True, null=True, db_index=True)
-    
+
+    land_use = models.CharField(
+        max_length=20,
+        choices=[
+            ('residential', 'Residential'),
+            ('commercial', 'Commercial'),
+            ('industrial', 'Industrial'),
+            ('agricultural', 'Agricultural'),
+            ('institutional', 'Institutional'),
+            ('mixed', 'Mixed Use'),
+        ],
+        default='residential',
+    )
+    unimproved_site_value = models.DecimalField(
+        max_digits=20, decimal_places=2, blank=True, null=True,
+        help_text="USV from the county valuation roll; blank means flat-rate by area",
+    )
+
     props = models.JSONField(blank=True, null=True)
-    
+
     class Meta:
         db_table = 'parcels'
         indexes = [
@@ -278,33 +362,21 @@ class Parcel(SecurityMixin):
                 except Exception:
                     self.centroid = None
             
-            # Calculate area - use geodetic calculation for WGS84
             if not self.area_m2:
-                try:
-                    if self.geom.srid == 4326:
-                        # For WGS84 (lat/lon), use geodetic area calculation
-                        # This is more accurate than transforming to Web Mercator
-                        from django.contrib.gis.geos import fromstr
-                        # Use the geometry's native area method which handles geodetic
-                        self.area_m2 = self.geom.area
-                        
-                        # If area is very small (likely in degrees), convert
-                        if self.area_m2 < 1:
-                            # Rough conversion: 1 degree² ≈ 12,400 km² at equator
-                            # For more accurate, we'd need the centroid latitude
-                            # But for now, just flag that this needs attention
-                            pass
-                    else:
-                        # For projected coordinates, direct area is in map units
-                        self.area_m2 = self.geom.area
-                except Exception:
-                    # Last resort: use raw area value
-                    try:
-                        self.area_m2 = self.geom.area
-                    except Exception:
-                        self.area_m2 = None
-        
+                self.area_m2 = self.compute_area_m2()
+
         super().save(*args, **kwargs)
+
+    def compute_area_m2(self) -> Optional[float]:
+        try:
+            geom = self.geom.clone()
+            if geom.srid != 4326:
+                geom.transform(4326)
+            zone = int((geom.centroid.x + 180) // 6) + 1
+            geom.transform((32600 if geom.centroid.y >= 0 else 32700) + zone)
+            return geom.area
+        except Exception:
+            return None
     
     def __str__(self):
         return f"Parcel {self.parcel_ref}"
@@ -337,7 +409,7 @@ class ParcelHistory(models.Model):
         """Compute hash including previous hash for chain integrity"""
         data = (
             f"{self.parcel_id}{self.owner_user_id}{self.area_m2}"
-            f"{self.changed_by_id}{self.change_ts}{self.previous_hash or ''}"
+            f"{self.changed_by_id}{self.change_reason}{self.previous_hash or ''}"
         )
         return hashlib.sha256(data.encode()).hexdigest()
     
@@ -401,15 +473,13 @@ class LedgerEntry(models.Model):
     
     def compute_entry_hash(self) -> str:
         """Compute HMAC for entry integrity"""
-        key = str(self.entry_id).encode()
-        message = (
-            f"{self.account_id}{self.amount}{self.balance_after}"
-            f"{self.entry_type}{self.created_at}"
-        ).encode()
-        return hmac.new(key, message, hashlib.sha256).hexdigest()
-    
+        return integrity_hmac(
+            self.entry_id, self.account_id, money(self.amount),
+            money(self.balance_after), self.entry_type,
+        )
+
     def save(self, *args, **kwargs):
-        if self.pk:
+        if not self._state.adding:
             raise ValidationError("Ledger entries are immutable and cannot be updated")
         
         self.entry_hash = self.compute_entry_hash()
@@ -428,7 +498,11 @@ class Payment(SecurityMixin):
     payment_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(User, on_delete=models.PROTECT, related_name="payments")
     account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="payments")
-    
+    parcel = models.ForeignKey(
+        Parcel, on_delete=models.PROTECT, related_name="payments", blank=True, null=True,
+    )
+    payment_year = models.IntegerField(blank=True, null=True, db_index=True)
+
     amount = models.DecimalField(max_digits=20, decimal_places=2)
     currency = models.CharField(max_length=3, default="KES")
     
@@ -468,15 +542,20 @@ class Payment(SecurityMixin):
             models.Index(fields=['user', '-created_at']),
             models.Index(fields=['status', '-created_at']),
         ]
-    
+        constraints = [
+            models.UniqueConstraint(
+                fields=['parcel', 'payment_year'],
+                condition=models.Q(parcel__isnull=False, payment_year__isnull=False),
+                name='one_rate_bill_per_parcel_year',
+            ),
+        ]
+
     def compute_payment_hash(self) -> str:
         """Compute integrity hash for payment"""
-        key = str(self.payment_id).encode()
-        message = (
-            f"{self.user_id}{self.account_id}{self.amount}"
-            f"{self.currency}{self.status}{self.deadline}{self.created_at}"
-        ).encode()
-        return hmac.new(key, message, hashlib.sha256).hexdigest()
+        return integrity_hmac(
+            self.payment_id, self.user_id, self.account_id,
+            money(self.amount), self.currency, self.status,
+        )
     
     def is_defaulter(self) -> bool:
         """Check if payment is past deadline and not completed"""
@@ -506,6 +585,31 @@ class Payment(SecurityMixin):
     
     def __str__(self):
         return f"Payment {self.payment_id} - {self.amount} {self.currency} ({self.status})"
+
+
+class MpesaTransaction(models.Model):
+    payment = models.ForeignKey(Payment, on_delete=models.PROTECT, related_name="mpesa_transactions")
+    checkout_request_id = models.CharField(max_length=100, unique=True)
+    merchant_request_id = models.CharField(max_length=100, blank=True)
+    phone = models.CharField(max_length=15)
+    amount = models.DecimalField(max_digits=20, decimal_places=2)
+    result_code = models.IntegerField(blank=True, null=True)
+    result_desc = models.TextField(blank=True)
+    receipt = models.CharField(max_length=30, blank=True, db_index=True)
+    raw_callback = models.JSONField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'mpesa_transactions'
+        ordering = ['-created_at']
+
+    @property
+    def is_final(self) -> bool:
+        return self.result_code is not None
+
+    def __str__(self):
+        return f"M-Pesa {self.checkout_request_id} ({self.result_code})"
 
 
 class AuditLog(models.Model):
@@ -540,16 +644,18 @@ class AuditLog(models.Model):
     
     def compute_log_hash(self) -> str:
         """Compute hash including previous hash for chain integrity"""
-        data = (
-            f"{self.who_id}{self.action}{self.object_type}"
-            f"{self.object_id}{self.created_at}{self.previous_hash or ''}"
+        return integrity_hmac(
+            self.who_id, self.action, self.object_type, self.object_id, self.ip_address,
+            json.dumps(self.details or {}, sort_keys=True, default=str), self.previous_hash or '',
         )
-        return hashlib.sha256(data.encode()).hexdigest()
+
+    def verify_integrity(self) -> bool:
+        return hmac.compare_digest(self.log_hash, self.compute_log_hash())
     
     def save(self, *args, **kwargs):
         """Create hash chain for audit trail"""
         if not self.pk:
-            last_log = AuditLog.objects.order_by('-created_at').first()
+            last_log = AuditLog.objects.order_by('-audit_id').first()
             if last_log:
                 self.previous_hash = last_log.log_hash
         
@@ -558,3 +664,44 @@ class AuditLog(models.Model):
     
     def __str__(self):
         return f"Audit: {self.action} by {self.who} at {self.created_at}"
+
+
+class ParcelDeletionRequest(SecurityMixin):
+    """A county official asking the platform owner to remove a parcel they cannot delete themselves."""
+
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+    ]
+
+    request_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    parcel = models.ForeignKey(
+        'Parcel', on_delete=models.CASCADE, related_name='deletion_requests',
+    )
+    requested_by = models.ForeignKey(
+        User, on_delete=models.PROTECT, related_name='parcel_deletion_requests',
+    )
+    reason = models.TextField(help_text="Why this parcel should go; shown to the platform owner")
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending', db_index=True)
+    reviewed_by = models.ForeignKey(
+        User, on_delete=models.PROTECT, related_name='parcel_deletions_reviewed',
+        null=True, blank=True,
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    decision_note = models.TextField(blank=True, default='')
+
+    class Meta:
+        db_table = 'parcel_deletion_requests'
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['status', 'created_at'])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['parcel'],
+                condition=models.Q(status='pending', is_deleted=False),
+                name='one_open_deletion_request_per_parcel',
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.parcel.parcel_ref} deletion ({self.status})"

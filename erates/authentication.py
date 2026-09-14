@@ -4,6 +4,7 @@ from rest_framework import serializers
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from .models import User
+from . import audit
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -19,9 +20,12 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             })
         
         
-        try:
-            user = User.objects.get(username=username, is_deleted=False)
-        except User.DoesNotExist:
+        user = (
+            User.objects.filter(username=username, is_deleted=False).first()
+            or User.objects.filter(username=username.lower(), is_deleted=False).first()
+        )
+        if user is None:
+            audit.record('auth.login_failed', object_type='user', identifier=audit.mask(username), method='username')
             raise serializers.ValidationError({
                 'detail': 'No active account found with the given credentials'
             })
@@ -34,11 +38,15 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         
       
         if user.is_locked():
+            audit.record('auth.login_locked', obj=user, who=user)
             raise serializers.ValidationError({
                 'detail': 'Account is temporarily locked due to failed login attempts'
             })
         
         if not user.check_password(password):
+            audit.record('auth.login_failed', obj=user, who=user, identifier=user.username, attempts=user.failed_login_attempts)
+            if user.locked_until:
+                audit.record('auth.login_locked', obj=user, who=user)
             raise serializers.ValidationError({
                 'detail': 'No active account found with the given credentials'
             })
@@ -47,6 +55,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         user.last_login = timezone.now()
         user.failed_login_attempts = 0
         user.save(update_fields=['last_login', 'failed_login_attempts'])
+        audit.record('auth.login', obj=user, who=user, method='username')
         
         refresh = self.get_token(user)
         
@@ -61,7 +70,9 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'username': user.username,
             'email': user.email,
             'role': user.role,
+            'county': user.county,
             'is_verified': user.is_verified,
+            'must_change_password': user.must_change_password,
         }
         
         return data
@@ -77,8 +88,10 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         token['username'] = user.username
         token['email'] = user.email
         token['role'] = user.role
+        token['county'] = user.county
         token['is_verified'] = user.is_verified
-        
+        token['must_change_password'] = user.must_change_password
+
         return token
 
 
@@ -124,21 +137,12 @@ class PhoneTokenObtainPairSerializer(TokenObtainPairSerializer):
         import re
         cleaned_phone = re.sub(r'[\s\-\(\)]', '', phone)
         
-        # Get user by phone number
         try:
-            # Since phone is encrypted, we need to check all active users
-            users = User.objects.filter(is_deleted=False, is_active=True)
-            user = None
-            for u in users:
-                # Decrypt and compare phone numbers
-                if u.phone and re.sub(r'[\s\-\(\)]', '', u.phone) == cleaned_phone:
-                    user = u
-                    break
-            
-            if not user:
+            user = User.find_by_phone(cleaned_phone)
+            if not user or not user.is_active:
                 raise User.DoesNotExist()
-                
         except User.DoesNotExist:
+            audit.record('auth.login_failed', object_type='user', identifier=audit.mask(cleaned_phone), method='phone')
             raise serializers.ValidationError({
                 'detail': 'No active account found with the given credentials'
             })
@@ -149,11 +153,15 @@ class PhoneTokenObtainPairSerializer(TokenObtainPairSerializer):
             })
         
         if user.is_locked():
+            audit.record('auth.login_locked', obj=user, who=user)
             raise serializers.ValidationError({
                 'detail': 'Account is temporarily locked due to failed login attempts'
             })
         
         if not user.check_password(password):
+            audit.record('auth.login_failed', obj=user, who=user, identifier=user.username, attempts=user.failed_login_attempts)
+            if user.locked_until:
+                audit.record('auth.login_locked', obj=user, who=user)
             raise serializers.ValidationError({
                 'detail': 'No active account found with the given credentials'
             })
@@ -162,6 +170,7 @@ class PhoneTokenObtainPairSerializer(TokenObtainPairSerializer):
         user.last_login = timezone.now()
         user.failed_login_attempts = 0
         user.save(update_fields=['last_login', 'failed_login_attempts'])
+        audit.record('auth.login', obj=user, who=user, method='phone')
         
         
         refresh = self.get_token(user)
@@ -178,7 +187,9 @@ class PhoneTokenObtainPairSerializer(TokenObtainPairSerializer):
             'email': user.email,
             'phone': user.phone,
             'role': user.role,
+            'county': user.county,
             'is_verified': user.is_verified,
+            'must_change_password': user.must_change_password,
         }
         
         return data
@@ -190,12 +201,14 @@ class PhoneTokenObtainPairSerializer(TokenObtainPairSerializer):
         """
         token = super().get_token(user)
         
-    
+
         token['username'] = user.username
         token['email'] = user.email
         token['role'] = user.role
+        token['county'] = user.county
         token['is_verified'] = user.is_verified
-        
+        token['must_change_password'] = user.must_change_password
+
         return token
 
 

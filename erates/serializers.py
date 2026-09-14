@@ -1,17 +1,14 @@
 from rest_framework import serializers
 from rest_framework_gis.serializers import GeoFeatureModelSerializer
 from django.contrib.auth.password_validation import validate_password
-from django.core.validators import MinLengthValidator, EmailValidator
-from django.utils import timezone
-from datetime import datetime, timedelta
-from django.db.models import Sum, Count, Avg, Q
+from django.core.validators import EmailValidator
 from decimal import Decimal
 import re
 from drf_spectacular.utils import extend_schema_field
 
 from .models import (
-    User, Account, Parcel, ParcelHistory, 
-    LedgerEntry, Payment, AuditLog
+    User, Account, County, Parcel, ParcelDeletionRequest, ParcelHistory, 
+    LedgerEntry, Payment, AuditLog, phone_lookup_hash
 )
 
 class UserListSerializer(serializers.ModelSerializer):
@@ -26,8 +23,8 @@ class UserDetailSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'user_id', 'username', 'email', 'phone', 'national_id',
-            'is_verified', 'is_active', 'role', 'last_login',
-            'created_at', 'updated_at'
+            'is_verified', 'is_active', 'role', 'county', 'must_change_password',
+            'last_login', 'created_at', 'updated_at'
         ]
         read_only_fields = [
             'user_id', 'is_verified', 'last_login', 
@@ -45,7 +42,7 @@ class UserDetailSerializer(serializers.ModelSerializer):
         
         # Only show PII to self, admins, or auditors
         user_role = getattr(user, 'role', 'user')  # Default to 'user' if role doesn't exist
-        if user != instance and user_role not in ['admin', 'auditor']:
+        if user != instance and user_role not in ['admin', 'auditor', 'owner']:
             data.pop('national_id', None)
             data.pop('phone', None)
             data.pop('email', None)
@@ -98,6 +95,8 @@ class UserCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     "Enter a valid phone number (10-15 digits)"
                 )
+            if User.objects.filter(phone_hash=phone_lookup_hash(cleaned)).exists():
+                raise serializers.ValidationError("This phone number is already registered to another account")
             return cleaned
         return value
     
@@ -115,6 +114,52 @@ class UserCreateSerializer(serializers.ModelSerializer):
         user.set_password(password)  # Uses Argon2
         user.save()
         return user
+
+
+class StaffCreatedUserSerializer(serializers.ModelSerializer):
+    """A signed-in official creating an account for someone else."""
+
+    class Meta:
+        model = User
+        fields = ['user_id', 'username', 'email', 'phone', 'national_id', 'role', 'county']
+        read_only_fields = ['user_id']
+
+    def validate_username(self, value):
+        if not re.match(r'^[a-zA-Z0-9_-]+$', value or ''):
+            raise serializers.ValidationError("Username can only contain letters, numbers, hyphens and underscores")
+        if len(value) < 3:
+            raise serializers.ValidationError("Username must be at least 3 characters long")
+        value = value.lower()
+        if User.objects.filter(username=value).exists():
+            raise serializers.ValidationError("That username is taken")
+        return value
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        cleaned = re.sub(r'[\s\-\(\)]', '', value)
+        if not re.match(r'^\+?[0-9]{10,15}$', cleaned):
+            raise serializers.ValidationError("Enter a valid phone number (10-15 digits)")
+        if User.objects.filter(phone_hash=phone_lookup_hash(cleaned)).exists():
+            raise serializers.ValidationError("This phone number is already registered to another account")
+        return cleaned
+
+    def validate(self, attrs):
+        creator = self.context['request'].user
+        role = attrs.get('role') or 'user'
+        if creator.is_platform_owner:
+            if role not in ('admin', 'auditor'):
+                raise serializers.ValidationError({'role': 'Platform owners create county officials (admin) or auditors'})
+            if not (attrs.get('county') or '').strip():
+                raise serializers.ValidationError({'county': 'Choose the county this official works for'})
+        else:
+            if role != 'user':
+                raise serializers.ValidationError({'role': 'County officials can only create land owner accounts'})
+            if not creator.county:
+                raise serializers.ValidationError({'county': 'Your account has no county set; ask the platform owner to fix it'})
+            attrs['county'] = creator.county
+        attrs['role'] = role
+        return attrs
 
 
 class UserUpdateSerializer(serializers.ModelSerializer):
@@ -142,6 +187,16 @@ class UserUpdateSerializer(serializers.ModelSerializer):
             'new_password', 'new_password_confirm'
         ]
     
+    def validate_phone(self, value):
+        if not value:
+            return value
+        cleaned = re.sub(r'[\s\-\(\)]', '', value)
+        if not re.match(r'^\+?[0-9]{10,15}$', cleaned):
+            raise serializers.ValidationError("Enter a valid phone number (10-15 digits)")
+        if User.objects.filter(phone_hash=phone_lookup_hash(cleaned)).exclude(pk=self.instance.pk).exists():
+            raise serializers.ValidationError("This phone number is already registered to another account")
+        return cleaned
+
     def validate(self, attrs):
         if 'new_password' in attrs:
             if 'current_password' not in attrs:
@@ -205,7 +260,7 @@ class AccountSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         request = self.context.get('request')
         
-        if request and request.user.role not in ['admin', 'auditor']:
+        if request and request.user.role not in ['admin', 'auditor', 'owner']:
             if request.user.user_id != instance.owner_user_id:
                 data.pop('owner_user', None)
                 data.pop('metadata', None)
@@ -330,7 +385,7 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         request = self.context.get('request')
 
-        if request and request.user.role not in ['admin', 'auditor']:
+        if request and request.user.role not in ['admin', 'auditor', 'owner']:
             data.pop('related_account_id', None)
             data.pop('external_ref', None)
         
@@ -363,19 +418,26 @@ class PaymentSerializer(serializers.ModelSerializer):
     integrity_verified = serializers.SerializerMethodField()
     is_defaulter = serializers.SerializerMethodField()
     days_overdue = serializers.SerializerMethodField()
-    
+    parcel_refs = serializers.SerializerMethodField()
+    parcel_ref = serializers.CharField(source='parcel.parcel_ref', read_only=True, default=None)
+
     class Meta:
         model = Payment
         fields = [
             'payment_id', 'user', 'user_username', 'account', 'account_type',
-            'amount', 'currency', 'processor', 'status', 'deadline', 
+            'parcel', 'parcel_ref', 'payment_year',
+            'amount', 'currency', 'processor', 'processor_ref', 'status', 'deadline',
             'is_defaulter', 'days_overdue', 'integrity_verified',
-            'failure_reason', 'created_at', 'updated_at'
+            'failure_reason', 'parcel_refs', 'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'payment_id', 'integrity_verified', 'is_defaulter', 
-            'days_overdue', 'created_at', 'updated_at'
+            'payment_id', 'status', 'processor_ref', 'integrity_verified', 'is_defaulter',
+            'days_overdue', 'parcel_refs', 'parcel_ref', 'created_at', 'updated_at'
         ]
+
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
+    def get_parcel_refs(self, obj) -> list:
+        return [parcel.parcel_ref for parcel in obj.user.parcels.all()]
     
     @extend_schema_field(serializers.BooleanField)
     def get_integrity_verified(self, obj) -> bool:
@@ -397,7 +459,7 @@ class PaymentSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         request = self.context.get('request')
 
-        if request and request.user.role not in ['admin', 'auditor']:
+        if request and request.user.role not in ['admin', 'auditor', 'owner']:
             if request.user.user_id != instance.user_id:
                 data.pop('processor', None)
         
@@ -413,6 +475,18 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
             'user', 'account', 'amount', 'currency',
             'processor', 'deadline', 'idempotency_key', 'metadata'
         ]
+        extra_kwargs = {'user': {'required': False}}
+
+    def validate(self, attrs):
+        request = self.context['request']
+        account = attrs['account']
+        if getattr(request.user, 'role', None) == 'admin':
+            user = attrs.setdefault('user', account.owner_user)
+        else:
+            user = attrs['user'] = request.user
+        if account.owner_user_id != user.user_id:
+            raise serializers.ValidationError({'account': 'Account does not belong to the paying user'})
+        return attrs
     
     def validate_amount(self, value):
         """Ensure amount is positive and within limits"""
@@ -433,16 +507,29 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
 
 class AuditLogSerializer(serializers.ModelSerializer):
 
-    who_username = serializers.CharField(source='who.username', read_only=True)
-    
+    who_username = serializers.CharField(source='who.username', read_only=True, default=None)
+    summary = serializers.SerializerMethodField()
+    category = serializers.SerializerMethodField()
+    integrity_verified = serializers.SerializerMethodField()
+
     class Meta:
         model = AuditLog
         fields = [
-            'audit_id', 'who', 'who_username', 'action',
-            'object_type', 'object_id', 'ip_address',
-            'details', 'created_at'
+            'audit_id', 'who', 'who_username', 'action', 'category', 'summary',
+            'object_type', 'object_id', 'ip_address', 'user_agent',
+            'details', 'integrity_verified', 'created_at'
         ]
         read_only_fields = fields  # Completely immutable
+
+    def get_summary(self, obj) -> str:
+        from .audit import describe
+        return describe(obj)
+
+    def get_category(self, obj) -> str:
+        return obj.action.split('.', 1)[0]
+
+    def get_integrity_verified(self, obj) -> bool:
+        return obj.verify_integrity()
     
     def to_representation(self, instance):
         """Hide sensitive details based on permissions"""
@@ -450,7 +537,7 @@ class AuditLogSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         
         # Only admins and auditors see full details
-        if request and request.user.role not in ['admin', 'auditor']:
+        if request and request.user.role not in ['admin', 'auditor', 'owner']:
             data.pop('ip_address', None)
             data.pop('details', None)
         
@@ -613,8 +700,71 @@ class DefaultersSummarySerializer(serializers.Serializer):
     defaulters = serializers.ListField(child=DefaulterSerializer())
 
 
+class ChatTurnSerializer(serializers.Serializer):
+    """One earlier turn of the same conversation."""
+    role = serializers.ChoiceField(choices=['user', 'assistant'])
+    text = serializers.CharField(allow_blank=True, trim_whitespace=True)
+
+
 class LLMQuerySerializer(serializers.Serializer):
     """Serializer for LLM queries"""
     query = serializers.CharField(required=True, help_text="The question to ask the LLM")
-    api_url = serializers.URLField(required=False, help_text="Optional override for Colab API URL")
+    history = ChatTurnSerializer(
+        many=True, required=False, max_length=6,
+        help_text="Recent turns, oldest first, so follow-up questions make sense",
+    )
 
+
+
+class CountySerializer(serializers.ModelSerializer):
+    """Counties the platform owner has onboarded."""
+    logo_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = County
+        fields = [
+            'county_id', 'name', 'logo', 'logo_url', 'rates_office_email',
+            'rates_office_phone', 'paybill', 'is_active', 'created_at',
+        ]
+        read_only_fields = ['county_id', 'logo_url', 'created_at']
+        extra_kwargs = {'logo': {'write_only': True, 'required': False}}
+
+    @extend_schema_field(serializers.CharField)
+    def get_logo_url(self, obj) -> str:
+        if not obj.logo:
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(obj.logo.url) if request else obj.logo.url
+
+    def validate_name(self, value):
+        name = ' '.join(value.split()).title()
+        if County.objects.filter(name__iexact=name).exclude(pk=getattr(self.instance, 'pk', None)).exists():
+            raise serializers.ValidationError('That county is already on the platform')
+        return name
+
+
+class ParcelDeletionRequestCreateSerializer(serializers.Serializer):
+    """What an official sends when asking for a plot to be removed."""
+    reason = serializers.CharField(min_length=10, max_length=1000, trim_whitespace=True)
+
+
+class ParcelDeletionRequestSerializer(serializers.ModelSerializer):
+    parcel_ref = serializers.CharField(source='parcel.parcel_ref', read_only=True)
+    county = serializers.CharField(source='parcel.county', read_only=True)
+    ward = serializers.CharField(source='parcel.ward', read_only=True)
+    requested_by_username = serializers.CharField(source='requested_by.username', read_only=True)
+    reviewed_by_username = serializers.CharField(source='reviewed_by.username', read_only=True, default=None)
+
+    class Meta:
+        model = ParcelDeletionRequest
+        fields = [
+            'request_id', 'parcel', 'parcel_ref', 'county', 'ward', 'reason', 'status',
+            'requested_by', 'requested_by_username', 'reviewed_by', 'reviewed_by_username',
+            'reviewed_at', 'decision_note', 'created_at',
+        ]
+        read_only_fields = fields
+
+
+class ParcelDeletionDecisionSerializer(serializers.Serializer):
+    """The platform owner's note when approving or rejecting."""
+    decision_note = serializers.CharField(required=False, allow_blank=True, max_length=1000)

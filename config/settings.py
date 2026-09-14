@@ -13,6 +13,9 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 import os
 
+from django.core.exceptions import ImproperlyConfigured
+from dotenv import load_dotenv
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -23,18 +26,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-s6nz__am9+9fk4fs&-a5n61vrqf$3c#b$8)dep1v%lnqjb)vp5'
+load_dotenv(BASE_DIR / '.env')
 
-# Field encryption key for encrypted_model_fields
-# SECURITY WARNING: In production, use environment variable and keep this secret!
-# Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-FIELD_ENCRYPTION_KEY = 'MS6_JnlvdCBLBk_NzTJlEDZdZkhtyGH6bFA_8gdgXMQ='
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+def env_required(name):
+    value = os.environ.get(name)
+    if not value:
+        raise ImproperlyConfigured(f"{name} must be set in the environment or in .env")
+    return value
 
-ALLOWED_HOSTS = []
+
+def env_list(name, default=''):
+    return [item.strip() for item in os.environ.get(name, default).split(',') if item.strip()]
+
+
+SECRET_KEY = env_required('SECRET_KEY')
+FIELD_ENCRYPTION_KEY = env_required('FIELD_ENCRYPTION_KEY')
+
+DEBUG = os.environ.get('DEBUG', 'False').lower() in ('1', 'true', 'yes')
+
+ALLOWED_HOSTS = env_list('ALLOWED_HOSTS', 'localhost,127.0.0.1')
 
 # Custom User Model
 AUTH_USER_MODEL = 'erates.User'
@@ -65,11 +76,14 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
+    'django.middleware.gzip.GZipMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'erates.audit.AuditRequestMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -94,7 +108,9 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000')
+# the browser needs this to read the download filename
+CORS_EXPOSE_HEADERS = ['Content-Disposition']
 
 CORS_ALLOW_CREDENTIALS = True
 
@@ -125,11 +141,11 @@ CORS_ALLOW_HEADERS = [
 DATABASES = {
     'default': {
         'ENGINE': 'django.contrib.gis.db.backends.postgis',
-        'NAME': 'e-rates',
-        'USER' : 'postgres',
-        'PASSWORD' : 'postgres',
-        'HOST': 'localhost',
-        'PORT' : '5432',
+        'NAME': os.environ.get('DB_NAME', 'e-rates'),
+        'USER': os.environ.get('DB_USER', 'postgres'),
+        'PASSWORD': env_required('DB_PASSWORD'),
+        'HOST': os.environ.get('DB_HOST', 'localhost'),
+        'PORT': os.environ.get('DB_PORT', '5432'),
         
     }
 }
@@ -173,11 +189,55 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = Path(os.environ.get('STATIC_ROOT', BASE_DIR / 'staticfiles'))
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = Path(os.environ.get('MEDIA_ROOT', BASE_DIR / 'media'))
+
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage'},
+}
+
+# --- Production hardening -------------------------------------------------
+# All of this is inert while DEBUG is on, so local development is unaffected.
+
+CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS', '')
+
+if not DEBUG:
+    # nginx terminates TLS, so trust the scheme it forwards.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', 'True').lower() in ('1', 'true', 'yes')
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.environ.get('SECURE_HSTS_SECONDS', 60 * 60 * 24 * 30))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = 'same-origin'
+    X_FRAME_OPTIONS = 'DENY'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+LLM_API_URL = os.environ.get('LLM_API_URL')
+LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen2.5')
+
+COUNTY_NAME = os.environ.get('COUNTY_NAME', 'Nairobi City County')
+
+MPESA_ENV = os.environ.get('MPESA_ENV', 'sandbox')
+MPESA_CONSUMER_KEY = os.environ.get('MPESA_CONSUMER_KEY', '')
+MPESA_CONSUMER_SECRET = os.environ.get('MPESA_CONSUMER_SECRET', '')
+MPESA_SHORTCODE = os.environ.get('MPESA_SHORTCODE', '174379')
+MPESA_PASSKEY = os.environ.get('MPESA_PASSKEY', '')
+MPESA_TRANSACTION_TYPE = os.environ.get('MPESA_TRANSACTION_TYPE', 'CustomerPayBillOnline')
+MPESA_PARTY_B = os.environ.get('MPESA_PARTY_B', '')  # till number for CustomerBuyGoodsOnline; paybill uses the shortcode
+MPESA_CALLBACK_URL = os.environ.get('MPESA_CALLBACK_URL', '')
+MPESA_CALLBACK_SECRET = os.environ.get('MPESA_CALLBACK_SECRET', '')
+MPESA_ACCOUNT_PREFIX = os.environ.get('MPESA_ACCOUNT_PREFIX', '')  # e.g. 'LR' so statements read LR1120
 
 
 REST_FRAMEWORK = {

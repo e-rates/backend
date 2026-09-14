@@ -1,0 +1,83 @@
+[project]
+name = "erates-backend"
+version = "0.1.0"
+description = "E-Rates Django + GeoDjango API"
+authors = [
+    {name = "Mike Kareu"}
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "django (==5.2.7)",
+    "djangorestframework (==3.16.1)",
+    "djangorestframework-gis (==1.2.0)",
+    "djangorestframework-simplejwt (==5.5.1)",
+    "django-filter (==25.2)",
+    "django-cors-headers (==4.9.0)",
+    "django-encrypted-model-fields (==0.6.5)",
+    "drf-spectacular (==0.29.0)",
+    "argon2-cffi (==25.1.0)",
+    "psycopg2-binary (==2.9.11)",
+    "requests (==2.32.5)",
+    "python-dotenv (>=1.1,<2.0)",
+    "openpyxl (>=3.1,<4.0)",
+    "reportlab (>=4.2,<5.0)",
+    "gunicorn (>=23.0,<24.0)",
+    "whitenoise (>=6.8,<7.0)"
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
+
+[dependency-groups]
+dev = [
+    "ruff (>=0.15.13,<0.16.0)"
+]
+
+[tool.poe.tasks.dev]
+help = "Run Django dev server"
+cmd = "python manage.py runserver 0.0.0.0:8000"
+
+[tool.poe.tasks.migrate]
+cmd = "python manage.py migrate"
+
+[tool.poe.tasks.makemigrations]
+cmd = "python manage.py makemigrations"
+
+[tool.poe.tasks.superuser]
+cmd = "python manage.py createsuperuser"
+
+[tool.poe.tasks.shell]
+cmd = "python manage.py shell"
+
+[tool.poe.tasks.djcheck]
+help = "Django system checks"
+cmd = "python manage.py check"
+
+[tool.poe.tasks.db-init]
+help = "Create e-rates database and PostGIS extension if missing"
+shell = """
+sudo service postgresql start >/dev/null
+export PGPASSWORD=postgres
+psql -h localhost -U postgres -tAc "select 1 from pg_database where datname='e-rates'" | grep -q 1 || psql -h localhost -U postgres -c 'create database "e-rates"'
+psql -h localhost -U postgres -d e-rates -c "create extension if not exists postgis" >/dev/null
+"""
+
+[tool.poe.tasks.setup]
+help = "Bootstrap DB, run checks and migrations"
+sequence = ["db-init", "djcheck", "migrate"]
+
+[tool.poe.tasks.lint]
+cmd = "ruff check . --fix"
+
+[tool.poe.tasks.format]
+cmd = "ruff format ."
+
+[tool.poe.tasks.test]
+cmd = "python manage.py test"
+
+[tool.poe.tasks.check]
+sequence = ["lint", "test"]
