@@ -2706,14 +2706,18 @@ class ReportsViewSet(viewsets.ViewSet):
 
 class LLMQueryView(APIView):
     """
-    View to handle queries to the Qwen LLM.
+    View to handle queries with intelligent dispatch to:
+    - Official PDF Report generation
+    - Unpaid / Defaulters drilldown
+    - IBM Granite SLM county reconciliation table
+    - Assistant tool fallback
     """
     permission_classes = [IsAdminOrAuditor]
     serializer_class = LLMQuerySerializer
 
     @extend_schema(
         summary="Ask the E-Rates assistant",
-        description="The model picks read-only data tools, the server runs them, and the model answers from the results.",
+        description="Handles natural language inquiries, generates official PDF reports, and queries live land/compliance records.",
         tags=['LLM'],
         request=LLMQuerySerializer,
         responses={
@@ -2729,24 +2733,129 @@ class LLMQueryView(APIView):
         query = serializer.validated_data['query']
         query_clean = query.strip().lower()
 
-        # Friendly greeting handling
+        # 1. Friendly greeting handling
         if query_clean in ('hey', 'hello', 'hi', 'howdy', 'greetings', 'help', 'hey there'):
             return Response({
-                "answer": "Hello! I am your E-Rates assistant powered by IBM Granite. Ask me about parcel compliance, revenue collections, or land figures for any county.",
+                "answer": "Hello! I am your E-Rates assistant powered by IBM Granite. Ask me about parcel compliance, revenue collections, or generate official reports for any county.",
                 "sources": [],
                 "used_fallback": False,
             })
 
-        # 1. First attempt via IBM Granite SLM
-        if extract_intent and format_markdown:
+        # Extract county from query or Granite SLM or user profile
+        user_county = getattr(request.user, 'county', None)
+        county = None
+        if extract_intent:
             try:
                 intent_data = extract_intent(query)
-                user_county = getattr(request.user, 'county', None)
-                county = intent_data.get("arguments", {}).get("county") or (user_county if user_county else "Nyeri")
+                county = intent_data.get("arguments", {}).get("county")
+            except Exception:
+                pass
 
-                year = timezone.now().year
-                now = timezone.now()
+        if not county:
+            for common in ('nyeri', 'nairobi', 'kiambu', 'nakuru', 'mombasa', 'kisumu', 'machakos', 'kilifi', 'uasin gishu'):
+                if common in query_clean:
+                    county = common.title()
+                    break
+        if not county:
+            county = user_county if user_county else "Nyeri"
 
+        year = timezone.now().year
+        now = timezone.now()
+
+        # 2. Check if user wants a downloadable PDF report
+        wants_report = any(w in query_clean for w in ('report', 'pdf', 'export', 'download', 'generate'))
+        if wants_report:
+            from .assistant import tool_generate_report_pdf, tool_generate_analysis_pdf
+            if any(w in query_clean for w in ('unpaid', 'upaid', 'defaulter', 'arrear', 'overdue', 'debt')):
+                rep_type = 'arrears'
+            elif any(w in query_clean for w in ('register', 'plot', 'parcel', 'boundary')):
+                rep_type = 'register'
+            else:
+                rep_type = 'collections'
+
+            try:
+                pdf_data = tool_generate_report_pdf({
+                    'report_type': rep_type,
+                    'year': year,
+                    'county': county,
+                }, user=request.user)
+
+                title = pdf_data.get('title', 'Official Report')
+                download_url = pdf_data.get('download_url', '')
+
+                unpaid_count = Payment.objects.filter(
+                    county_q('parcel__county', county),
+                    deadline__lt=now,
+                    is_deleted=False,
+                ).exclude(status__in=['completed', 'refunded']).count()
+
+                answer = (
+                    f"### {title} — {county} County\n\n"
+                    f"I have compiled the official **{title}** for **{county} County** ({year}). "
+                    f"The document includes full property breakdowns, statutory compliance records, and valuation rolls.\n\n"
+                    f"[{title}]({download_url})\n\n"
+                    f"- **County:** {county}\n"
+                    f"- **Rating Year:** {year}\n"
+                    f"- **Total Identified Defaulters:** {unpaid_count}\n"
+                    f"- **Status:** Official PDF compiled and ready for download."
+                )
+
+                return Response({
+                    "answer": answer,
+                    "sources": [
+                        {"tool": "generate_report_pdf", "args": {"county": county, "report_type": rep_type, "year": year}},
+                        {"tool": "defaulters" if rep_type == 'arrears' else "collections", "args": {"county": county, "year": year}},
+                    ],
+                    "used_fallback": False,
+                })
+            except Exception:
+                pass
+
+        # 3. Check if user asked specifically for unpaid parcels / defaulters list
+        wants_defaulters = any(w in query_clean for w in ('unpaid', 'upaid', 'defaulter', 'arrear', 'overdue', 'debt'))
+        if wants_defaulters:
+            try:
+                defaulters_qs = Payment.objects.filter(
+                    county_q('parcel__county', county),
+                    deadline__lt=now,
+                    is_deleted=False,
+                ).exclude(status__in=['completed', 'refunded']).select_related('parcel', 'user')[:20]
+
+                if defaulters_qs.exists():
+                    rows = []
+                    for b in defaulters_qs:
+                        ref = b.parcel.parcel_ref if b.parcel else 'N/A'
+                        ward = b.parcel.ward if b.parcel and b.parcel.ward else 'N/A'
+                        owner = b.user.username if b.user else 'Unassigned'
+                        days = b.days_overdue() or 0
+                        rows.append(f"| {ref} | {ward} | {owner} | {b.payment_year} | KES {b.amount:,.2f} | {days} days |")
+
+                    table = "\n".join(rows)
+                    answer = (
+                        f"### Unpaid Land Parcels — {county} County ({year})\n\n"
+                        f"| Parcel Ref | Ward | Owner | Year | Amount | Overdue |\n"
+                        f"| --- | --- | --- | --- | --- | --- |\n"
+                        f"{table}\n\n"
+                        f"*Showing top {len(rows)} overdue parcel bills.*"
+                    )
+                else:
+                    answer = (
+                        f"### Unpaid Land Parcels — {county} County ({year})\n\n"
+                        f"There are currently **0 unpaid or overdue parcel bills** recorded in the database for **{county} County** in {year}.\n\n"
+                        f"- All registered parcels in {county} County are either compliant, fully paid, or pending new billing cycles."
+                    )
+
+                return Response({
+                    "answer": answer,
+                    "sources": [{"tool": "defaulters", "args": {"county": county, "year": year}}],
+                    "used_fallback": False,
+                })
+            except Exception:
+                pass
+
+        # 4. Standard County Reconciliation Overview via IBM Granite SLM
+        if extract_intent and format_markdown:
+            try:
                 parcels_qs = Parcel.objects.filter(county_q('county', county), is_deleted=False)
                 parcel_stats = parcels_qs.aggregate(
                     total_parcels=Count('parcel_id'),
@@ -2798,7 +2907,7 @@ class LLMQueryView(APIView):
             except Exception:
                 pass
 
-        # 2. Fall back to assistant tool agent
+        # 5. Fallback to assistant tool agent
         from . import assistant
         if not settings.LLM_API_URL:
             return Response({"error": "LLM_API_URL is not configured on the server"},
