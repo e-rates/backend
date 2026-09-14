@@ -50,7 +50,7 @@ ALLOWED_HOSTS = env_list('ALLOWED_HOSTS', 'localhost,127.0.0.1')
 # Custom User Model
 AUTH_USER_MODEL = 'erates.User'
 
-APPEND_SLASH = False
+APPEND_SLASH = True
 
 
 # Application definition
