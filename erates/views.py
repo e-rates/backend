@@ -2724,16 +2724,76 @@ class LLMQueryView(APIView):
         },
     )
     def post(self, request):
-        from . import assistant
-
         serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
+        query = serializer.validated_data['query']
+
+        # 1. First attempt via IBM Granite SLM
+        if extract_intent and format_markdown:
+            try:
+                intent_data = extract_intent(query)
+                user_county = getattr(request.user, 'county', None)
+                county = intent_data.get("arguments", {}).get("county") or (user_county if user_county else "Nyeri")
+
+                year = timezone.now().year
+                now = timezone.now()
+
+                parcels_qs = Parcel.objects.filter(county_q('county', county), is_deleted=False)
+                parcel_stats = parcels_qs.aggregate(
+                    total_parcels=Count('parcel_id'),
+                    total_area_m2=Sum('area_m2'),
+                )
+                total_parcels = parcel_stats['total_parcels'] or 0
+                total_area_m2 = parcel_stats['total_area_m2'] or 0.0
+
+                bills_qs = Payment.objects.filter(
+                    county_q('parcel__county', county),
+                    payment_year=year,
+                    is_deleted=False,
+                ).exclude(status='refunded')
+
+                bill_stats = bills_qs.aggregate(
+                    total_billed=Sum('amount'),
+                    total_collected=Sum('amount', filter=Q(status='completed')),
+                    compliant_count=Count('payment_id', filter=Q(status='completed')),
+                    defaulter_count=Count('payment_id', filter=Q(status__in=['pending', 'processing', 'failed'], deadline__lt=now)),
+                )
+
+                total_collected = float(bill_stats['total_collected'] or Decimal('0'))
+                total_billed = float(bill_stats['total_billed'] or Decimal('0'))
+                compliant = bill_stats['compliant_count'] or 0
+                defaulters = bill_stats['defaulter_count'] or 0
+                outstanding = max(0.0, total_billed - total_collected)
+
+                metrics = {
+                    "county": county,
+                    "year": year,
+                    "total_parcels": total_parcels,
+                    "total_area_sq_km": round(total_area_m2 / 1_000_000, 2),
+                    "compliant": compliant,
+                    "defaulters": defaulters,
+                    "total_billed_kes": total_billed,
+                    "total_collected_kes": total_collected,
+                    "outstanding_kes": outstanding,
+                }
+
+                report = format_markdown(county=county, data=metrics)
+                return Response({
+                    "answer": report,
+                    "sources": [f"{county} Parcel Register", f"{county} Valuation Roll", f"{year} Rates Ledger"],
+                    "used_fallback": False,
+                })
+            except Exception:
+                pass
+
+        # 2. Fall back to assistant tool agent
+        from . import assistant
         if not settings.LLM_API_URL:
             return Response({"error": "LLM_API_URL is not configured on the server"},
                             status=status.HTTP_503_SERVICE_UNAVAILABLE)
         try:
             return Response(assistant.answer(
-                serializer.validated_data['query'],
+                query,
                 history=serializer.validated_data.get('history'),
                 user=request.user,
             ))
