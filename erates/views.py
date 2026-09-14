@@ -2727,6 +2727,15 @@ class LLMQueryView(APIView):
         serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
         query = serializer.validated_data['query']
+        query_clean = query.strip().lower()
+
+        # Friendly greeting handling
+        if query_clean in ('hey', 'hello', 'hi', 'howdy', 'greetings', 'help', 'hey there'):
+            return Response({
+                "answer": "Hello! I am your E-Rates assistant powered by IBM Granite. Ask me about parcel compliance, revenue collections, or land figures for any county.",
+                "sources": [],
+                "used_fallback": False,
+            })
 
         # 1. First attempt via IBM Granite SLM
         if extract_intent and format_markdown:
@@ -2780,7 +2789,10 @@ class LLMQueryView(APIView):
                 report = format_markdown(county=county, data=metrics)
                 return Response({
                     "answer": report,
-                    "sources": [f"{county} Parcel Register", f"{county} Valuation Roll", f"{year} Rates Ledger"],
+                    "sources": [
+                        {"tool": "parcels", "args": {"county": county}},
+                        {"tool": "collections", "args": {"county": county, "year": year}},
+                    ],
                     "used_fallback": False,
                 })
             except Exception:
