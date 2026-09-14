@@ -2816,3 +2816,84 @@ class ParcelDeletionRequestViewSet(mixins.ListModelMixin,
     @action(detail=True, methods=['post'], permission_classes=[IsPlatformOwner])
     def reject(self, request, pk=None):
         return self._decide(request, approve=False)
+
+
+try:
+    from .slm_client import extract_intent, format_markdown
+except ImportError:
+    try:
+        from slm_client import extract_intent, format_markdown
+    except ImportError:
+        extract_intent = None
+        format_markdown = None
+
+
+class AIReconciliationView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        prompt = request.data.get("prompt")
+        if not prompt:
+            return Response({"error": "Prompt is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not extract_intent or not format_markdown:
+            return Response({"error": "SLM client not configured or missing"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        try:
+            intent_data = extract_intent(prompt)
+            county = intent_data.get("arguments", {}).get("county", "Nyeri")
+        except Exception as e:
+            return Response({"error": f"Inference error: {str(e)}"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        year = timezone.now().year
+        now = timezone.now()
+
+        parcels_qs = Parcel.objects.filter(county_q('county', county), is_deleted=False)
+        parcel_stats = parcels_qs.aggregate(
+            total_parcels=Count('parcel_id'),
+            total_area_m2=Sum('area_m2'),
+        )
+        total_parcels = parcel_stats['total_parcels'] or 0
+        total_area_m2 = parcel_stats['total_area_m2'] or 0.0
+
+        bills_qs = Payment.objects.filter(
+            county_q('parcel__county', county),
+            payment_year=year,
+            is_deleted=False,
+        ).exclude(status='refunded')
+
+        bill_stats = bills_qs.aggregate(
+            total_billed=Sum('amount'),
+            total_collected=Sum('amount', filter=Q(status='completed')),
+            compliant_count=Count('payment_id', filter=Q(status='completed')),
+            defaulter_count=Count('payment_id', filter=Q(status__in=['pending', 'processing', 'failed'], deadline__lt=now)),
+        )
+
+        total_collected = float(bill_stats['total_collected'] or Decimal('0'))
+        total_billed = float(bill_stats['total_billed'] or Decimal('0'))
+        compliant = bill_stats['compliant_count'] or 0
+        defaulters = bill_stats['defaulter_count'] or 0
+        outstanding = max(0.0, total_billed - total_collected)
+
+        metrics = {
+            "county": county,
+            "year": year,
+            "total_parcels": total_parcels,
+            "total_area_sq_km": round(total_area_m2 / 1_000_000, 2),
+            "compliant": compliant,
+            "defaulters": defaulters,
+            "total_billed_kes": total_billed,
+            "total_collected_kes": total_collected,
+            "outstanding_kes": outstanding,
+        }
+
+        try:
+            markdown_report = format_markdown(county=county, data=metrics)
+        except Exception as e:
+            return Response({"error": f"Formatting error: {str(e)}"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response({
+            "county": county,
+            "metrics": metrics,
+            "report": markdown_report,
+        })
