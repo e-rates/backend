@@ -45,50 +45,64 @@ class WaiverTests(APITestCase):
     def create(self, **overrides):
         return self.client.post('/api/waivers/', self.body(**overrides), format='json')
 
+    def claim(self, waiver_id, user=None):
+        self.client.force_authenticate(user or self.owner)
+        resp = self.client.post(f'/api/waivers/{waiver_id}/claim/')
+        self.client.force_authenticate(self.admin)
+        return resp
+
+    def create_and_claim(self, **overrides):
+        waiver_id = self.create(**overrides).json()['waiver_id']
+        self.claim(waiver_id)
+        return waiver_id
+
     def test_preview_saves_nothing(self):
         resp = self.client.post('/api/waivers/preview/', self.body(), format='json')
         self.assertEqual(resp.json()['bills'], 1)
         self.assertEqual(resp.json()['amount_waived'], '500')
         self.assertFalse(Waiver.objects.exists())
-        self.assertEqual(self.bill(self.karura).amount, Decimal('1000'))
 
-    def test_waiver_reduces_only_covered_open_bills_in_its_county(self):
+    def test_nothing_comes_off_until_claimed(self):
+        waiver_id = self.create().json()['waiver_id']
+        self.assertEqual(self.bill(self.karura).amount, Decimal('1000'))
+        resp = self.claim(waiver_id)
+        self.assertEqual(resp.json()['claimed_plots'], ['N1'])
+        self.assertEqual(self.bill(self.karura).amount, Decimal('500'))
+        self.assertEqual(self.bill(self.karura).metadata['waiver']['name'], 'Drought relief')
+        self.assertTrue(AuditLog.objects.filter(action='waiver.claimed').exists())
+
+    def test_claim_reduces_only_covered_open_bills_in_its_county(self):
         paid = self.bill(self.gaaki)
         paid.status = 'completed'
         paid.save()
-        resp = self.create(wards=[])
-        self.assertEqual(resp.status_code, 201)
-        self.assertEqual(resp.json()['bills_affected'], 2)
+        self.create_and_claim(wards=[])
         self.assertEqual(self.bill(self.karura).amount, Decimal('500'))
-        self.assertEqual(self.bill(self.karura).metadata['waiver']['name'], 'Drought relief')
+        self.assertEqual(self.bill(self.farm).amount, Decimal('500'))
         self.assertEqual(self.bill(self.gaaki).amount, Decimal('1000'))
         self.assertEqual(self.bill(self.kiambu).amount, Decimal('1000'))
-        self.assertTrue(AuditLog.objects.filter(action='waiver.created').exists())
 
     def test_blocks_combine(self):
-        self.create(wards=[], land_uses=['agricultural'])
+        self.create_and_claim(wards=[], land_uses=['agricultural'])
         self.assertEqual(self.bill(self.farm).amount, Decimal('500'))
         self.assertEqual(self.bill(self.karura).amount, Decimal('1000'))
 
-    def test_highest_waiver_wins(self):
-        self.create()
-        self.create(percent='20', wards=[])
+    def test_highest_claimed_waiver_wins(self):
+        self.create_and_claim()
+        self.create_and_claim(percent='20', wards=[])
         self.assertEqual(self.bill(self.karura).amount, Decimal('500'))
         self.assertEqual(self.bill(self.gaaki).amount, Decimal('800'))
 
     def test_full_waiver_settles_and_revoke_restores(self):
-        waiver_id = self.create(percent='100').json()['waiver_id']
+        waiver_id = self.create_and_claim(percent='100')
         bill = self.bill(self.karura)
         self.assertEqual((bill.status, bill.processor, bill.amount), ('completed', 'waiver', Decimal('0')))
-        resp = self.client.post(f'/api/waivers/{waiver_id}/revoke/')
-        self.assertEqual(resp.json()['status'], 'revoked')
+        self.assertEqual(self.client.post(f'/api/waivers/{waiver_id}/revoke/').json()['status'], 'revoked')
         bill = self.bill(self.karura)
         self.assertEqual((bill.status, bill.processor, bill.amount), ('pending', None, Decimal('1000')))
         self.assertNotIn('waiver', bill.metadata)
-        self.assertTrue(bill.verify_integrity() if hasattr(bill, 'verify_integrity') else True)
 
-    def test_reissue_keeps_waiver_on_new_amount(self):
-        self.create()
+    def test_reissue_keeps_claimed_waiver_on_new_amount(self):
+        self.create_and_claim()
         self.schedule.top_amount = Decimal('3000')
         self.schedule.save()
         generate_rate_bills(self.schedule)
@@ -96,11 +110,11 @@ class WaiverTests(APITestCase):
         self.assertEqual(generate_rate_bills(self.schedule)['unchanged'], 3)
 
     def test_future_waiver_waits(self):
-        self.create(starts_on=(date.today() + timedelta(days=3)).isoformat())
+        self.create_and_claim(starts_on=(date.today() + timedelta(days=3)).isoformat())
         self.assertEqual(self.bill(self.karura).amount, Decimal('1000'))
 
     def test_mpesa_charges_the_waived_amount(self):
-        self.create()
+        self.create_and_claim()
         self.client.force_authenticate(self.owner)
         with mock.patch.object(mpesa, 'stk_push', return_value={
             'CheckoutRequestID': 'ws_CO_1', 'MerchantRequestID': 'm-1', 'ResponseCode': '0',
@@ -115,15 +129,16 @@ class WaiverTests(APITestCase):
         self.assertEqual(len(self.client.get('/api/waivers/').json()), 1)
         self.assertEqual(self.create().status_code, 403)
 
-    def test_landowner_sees_waivers_on_their_plots(self):
-        self.create()
+    def test_landowner_sees_and_only_claims_their_covered_plots(self):
+        waiver_id = self.create().json()['waiver_id']
         stranger = User.objects.create_user('otieno', 'o@example.com', 'Password123!')
         plot('N9', 'Nyeri', stranger, ward='Gaaki')
         self.client.force_authenticate(self.owner)
         mine = self.client.get('/api/waivers/mine/').json()
-        self.assertEqual([(w['name'], w['plots']) for w in mine], [('Drought relief', ['N1'])])
+        self.assertEqual([(w['name'], w['plots'], w['claimed_plots']) for w in mine], [('Drought relief', ['N1'], [])])
         self.client.force_authenticate(stranger)
         self.assertEqual(self.client.get('/api/waivers/mine/').json(), [])
+        self.assertEqual(self.claim(waiver_id, stranger).status_code, 404)
 
     def test_invalid_percent_rejected(self):
         self.assertEqual(self.create(percent='120').status_code, 400)

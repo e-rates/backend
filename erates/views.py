@@ -29,6 +29,7 @@ from .models import (
     Conversation,
     RateSchedule,
     Waiver,
+    WaiverClaim,
     User,
     Account,
     County,
@@ -2955,7 +2956,7 @@ class WaiverViewSet(viewsets.GenericViewSet):
     serializer_class = WaiverSerializer
 
     def get_permissions(self):
-        if self.action == 'mine':
+        if self.action in ('mine', 'claim'):
             return [permissions.IsAuthenticated()]
         return [IsAdminOrAuditor()] if self.action == 'list' else [IsAdmin()]
 
@@ -3026,14 +3027,40 @@ class WaiverViewSet(viewsets.GenericViewSet):
         parcels = list(Parcel.objects.filter(owner_user=request.user, is_deleted=False))
         rows = []
         for waiver in Waiver.objects.filter(revoked_at__isnull=True, is_deleted=False).select_related('county'):
-            plots = [p.parcel_ref for p in parcels
-                     if find_county(p.county) == waiver.county and waivers.covers(waiver, p)]
+            plots = self._my_plots(waiver, parcels)
             if plots:
+                claimed = waiver.claims.filter(parcel__in=plots).values_list('parcel__parcel_ref', flat=True)
                 data = self.get_serializer(waiver).data
                 rows.append({key: data[key] for key in (
-                    'waiver_id', 'county', 'name', 'legal_reference', 'percent', 'years', 'starts_on', 'ends_on', 'status',
-                )} | {'plots': plots})
+                    'waiver_id', 'county', 'name', 'legal_reference', 'percent', 'years', 'starts_on', 'ends_on',
+                    'status', 'created_at',
+                )} | {'plots': [p.parcel_ref for p in plots], 'claimed_plots': sorted(claimed)})
         return Response(rows)
+
+    @staticmethod
+    def _my_plots(waiver, parcels):
+        return [p for p in parcels if find_county(p.county) == waiver.county and waivers.covers(waiver, p)]
+
+    @extend_schema(summary="Claim a waiver for the signed-in landowner's covered plots", tags=['Billing'])
+    @action(detail=True, methods=['post'])
+    def claim(self, request, pk=None):
+        from django.db import transaction
+
+        waiver = Waiver.objects.filter(pk=pk, revoked_at__isnull=True, is_deleted=False).select_related('county').first()
+        parcels = list(Parcel.objects.filter(owner_user=request.user, is_deleted=False))
+        plots = self._my_plots(waiver, parcels) if waiver else []
+        if not plots:
+            return Response({'detail': 'This waiver does not cover any of your plots.'}, status=status.HTTP_404_NOT_FOUND)
+        if waiver.ends_on and waiver.ends_on < timezone.localdate():
+            raise ValidationError({'detail': 'This waiver has ended.'})
+        with transaction.atomic():
+            new = [p.parcel_ref for p in plots
+                   if WaiverClaim.objects.get_or_create(waiver=waiver, parcel=p, defaults={'user': request.user})[1]]
+            outcome = waivers.apply_waivers(waiver.county)
+            if new:
+                audit.record('waiver.claimed', obj=waiver, object_type='waiver', county=waiver.county.name,
+                             name=waiver.name, plots=new, **outcome)
+        return Response({'claimed_plots': sorted(p.parcel_ref for p in plots), **outcome})
 
 
 class ConversationViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet):

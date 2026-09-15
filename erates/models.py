@@ -761,6 +761,21 @@ class Waiver(SecurityMixin):
         return f"{self.county.name}: {self.name} ({self.percent}%)"
 
 
+class WaiverClaim(models.Model):
+    """A landowner claiming a waiver for one of their plots; only claimed plots get the relief."""
+    claim_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    waiver = models.ForeignKey(Waiver, on_delete=models.PROTECT, related_name='claims')
+    parcel = models.ForeignKey(Parcel, on_delete=models.PROTECT, related_name='waiver_claims')
+    user = models.ForeignKey(User, on_delete=models.PROTECT, related_name='waiver_claims')
+    claimed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'waiver_claims'
+        constraints = [
+            models.UniqueConstraint(fields=['waiver', 'parcel'], name='one_claim_per_waiver_parcel'),
+        ]
+
+
 class Conversation(SecurityMixin):
     """One official's chat with the assistant, kept so they can return to it."""
     conversation_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

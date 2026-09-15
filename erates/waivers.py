@@ -1,9 +1,10 @@
+from collections import defaultdict
 from decimal import Decimal
 
 from django.db.models import Q
 from django.utils import timezone
 
-from .models import Payment, Waiver
+from .models import Payment, Waiver, WaiverClaim
 from .rate_reports import county_q
 
 UNPAID = ('pending', 'failed')
@@ -11,10 +12,16 @@ UNPAID = ('pending', 'failed')
 
 def active_waivers(county):
     today = timezone.localdate()
-    return list(Waiver.objects.filter(
+    rows = list(Waiver.objects.filter(
         Q(ends_on__isnull=True) | Q(ends_on__gte=today),
         county=county, revoked_at__isnull=True, is_deleted=False, starts_on__lte=today,
     ))
+    claimed = defaultdict(set)
+    for waiver_id, parcel_id in WaiverClaim.objects.filter(waiver__in=rows).values_list('waiver_id', 'parcel_id'):
+        claimed[waiver_id].add(parcel_id)
+    for waiver in rows:
+        waiver.claimed = claimed[waiver.pk]
+    return rows
 
 
 def _in(values, value):
@@ -32,7 +39,7 @@ def covers(waiver, parcel, year=None):
 
 
 def best(waivers, parcel, year):
-    matching = [w for w in waivers if covers(w, parcel, year)]
+    matching = [w for w in waivers if parcel.pk in w.claimed and covers(w, parcel, year)]
     return max(matching, key=lambda w: w.percent, default=None)
 
 

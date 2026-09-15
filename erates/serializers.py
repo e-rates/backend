@@ -817,15 +817,19 @@ class WaiverSerializer(serializers.ModelSerializer):
     created_by = serializers.CharField(source='created_by.username', read_only=True, default=None)
     revoked_by = serializers.CharField(source='revoked_by.username', read_only=True, default=None)
     status = serializers.SerializerMethodField()
+    claims = serializers.SerializerMethodField()
 
     class Meta:
         model = Waiver
         fields = [
             'waiver_id', 'county', 'name', 'legal_reference', 'percent', 'years', 'sub_counties', 'wards',
             'land_uses', 'parcel_refs', 'starts_on', 'ends_on', 'status', 'created_by', 'created_at',
-            'revoked_by', 'revoked_at', 'bills_affected', 'amount_waived',
+            'revoked_by', 'revoked_at', 'bills_affected', 'amount_waived', 'claims',
         ]
         read_only_fields = ['waiver_id', 'created_at', 'revoked_at', 'bills_affected', 'amount_waived']
+
+    def get_claims(self, obj) -> int:
+        return obj.claims.count()
 
     def get_status(self, obj) -> str:
         today = timezone.localdate()
