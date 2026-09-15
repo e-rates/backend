@@ -276,7 +276,7 @@ def _call_llm(prompt: str) -> str:
             raise AssistantError(f'The model server refused the request ({resp.status_code}).')
         if resp.status_code == 404:
             raise AssistantError(
-                f'The model server has no "{settings.LLM_MODEL}" — check the name against `ollama list`.'
+                f'Language model endpoint returned 404 Not Found at {endpoint}. Ensure the AI model server is running.'
             )
         raise AssistantError(f'Language model returned {resp.status_code}')
     try:

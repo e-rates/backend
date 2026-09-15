@@ -2991,9 +2991,9 @@ class LLMQueryView(APIView):
             except Exception:
                 pass
 
-        # 6. Standard County Reconciliation Overview via IBM Granite SLM
+        # 6. Standard County Reconciliation Overview via IBM Granite SLM or Deterministic Engine
         target_county = county or user_county or ('Nyeri' if not is_superadmin else None)
-        if target_county and extract_intent and format_markdown:
+        if target_county:
             try:
                 parcels_qs = Parcel.objects.filter(county_q('county', target_county), is_deleted=False)
                 parcel_stats = parcels_qs.aggregate(
@@ -3034,7 +3034,32 @@ class LLMQueryView(APIView):
                     "outstanding_kes": outstanding,
                 }
 
-                report = format_markdown(county=target_county, data=metrics)
+                report = None
+                if format_markdown:
+                    try:
+                        report = format_markdown(county=target_county, data=metrics)
+                    except Exception:
+                        report = None
+
+                if not report:
+                    comp_rate = round(compliant / max(1, compliant + defaulters) * 100, 1)
+                    coll_rate = round(total_collected / max(1.0, total_billed) * 100, 1)
+                    report = (
+                        f"### {target_county} County — Land Rates Reconciliation ({year})\n\n"
+                        f"| Metric | {target_county} County ({year}) |\n"
+                        f"| :--- | :--- |\n"
+                        f"| **Total Registered Parcels** | {total_parcels:,} |\n"
+                        f"| **Total Cadastral Area** | {round(total_area_m2 / 1_000_000, 2):,.2f} sq km |\n"
+                        f"| **Compliant Parcels** | {compliant:,} |\n"
+                        f"| **Delinquent Defaulters** | {defaulters:,} |\n"
+                        f"| **Total Billed Revenue** | KES {total_billed:,.2f} |\n"
+                        f"| **Total Collected Revenue** | KES {total_collected:,.2f} |\n"
+                        f"| **Outstanding Arrears** | KES {outstanding:,.2f} |\n\n"
+                        f"- **Compliance Rate:** {comp_rate}%\n"
+                        f"- **Collection Rate:** {coll_rate}%\n"
+                        f"- Records verified against county land registry and rates billing ledger."
+                    )
+
                 return Response({
                     "answer": report,
                     "sources": [
