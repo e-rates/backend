@@ -60,7 +60,7 @@ class MpesaFlowTests(APITestCase):
         return resp.json()['features'][0]['properties']
 
     def test_bill_amount_uses_flat_band_then_usv(self):
-        schedule = RateSchedule.objects.get(county__name='Nairobi', year=2026)
+        schedule = RateSchedule.objects.get(county__name='Nairobi City County', year=2026)
         self.assertEqual(self.bill.amount, annual_rate(self.parcel, schedule))
         self.assertEqual(generate_rate_bills(schedule)['unchanged'], 1)
         self.parcel.unimproved_site_value = Decimal('10000000')

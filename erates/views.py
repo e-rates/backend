@@ -78,6 +78,7 @@ from .serializers import (
     LLMQuerySerializer,
 )
 from . import audit, mpesa, parcel_deletion, payment_flow, rate_reports
+from .counties import KENYA_COUNTIES
 import hmac
 
 from .shapefile_serializers import (
@@ -2010,6 +2011,7 @@ class CountyViewSet(viewsets.ModelViewSet):
     """Counties on the platform. Owners manage them; staff read their own."""
     queryset = County.objects.all()
     serializer_class = CountySerializer
+    http_method_names = ['get', 'patch', 'head', 'options']
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['is_active']
@@ -2028,10 +2030,6 @@ class CountyViewSet(viewsets.ModelViewSet):
         if c:
             return self.queryset.filter(pk=c.pk)
         return self.queryset.filter(name__icontains=re.sub(r'\s+(city\s+)?county$', '', county_name, flags=re.IGNORECASE).strip())
-
-    def perform_create(self, serializer):
-        county = serializer.save()
-        audit.record('county.added', obj=county, object_type='county', name=county.name)
 
     def perform_update(self, serializer):
         county = serializer.save()
@@ -2716,11 +2714,7 @@ class ReportsViewSet(viewsets.ViewSet):
         
         return response
 
-COUNTY_NAMES = (
-    'nyeri', 'nairobi', 'kiambu', 'nakuru', 'mombasa', 'kisumu', 'machakos',
-    'kilifi', 'uasin gishu', 'meru', 'embu', "murang'a", 'kajiado', 'laikipia',
-    'garissa', 'kakamega', 'kisii', 'narok', 'kericho', 'bungoma', 'turkana',
-)
+COUNTY_NAMES = tuple(re.sub(r'\s+(city\s+)?county$', '', name, flags=re.I).lower() for name in KENYA_COUNTIES)
 MULTI_COUNTY_PHRASES = ('all counties', 'every county', 'across counties', 'national', 'countrywide', 'all county', 'other counties')
 
 

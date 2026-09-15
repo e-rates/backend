@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal
 
 from erates.models import County, Parcel, RateSchedule
@@ -7,7 +8,11 @@ NAIROBI_BANDS = [{'max_ha': '0.1', 'amount': '2560'}, {'max_ha': '0.2', 'amount'
 
 
 def schedule_for(county_name, year, deadline, **overrides):
-    county = County.objects.filter(name__iexact=county_name).first() or County.objects.create(name=county_name)
+    base = re.sub(r'\s+(city\s+)?county$', '', county_name, flags=re.I)
+    county = (
+        County.objects.filter(name__iregex=rf'^{re.escape(base)}(\s+(city\s+)?county)?$').first()
+        or County.objects.create(name=county_name)
+    )
     values = {
         'bands': NAIROBI_BANDS, 'top_amount': Decimal('4800'), 'usv_rate_percent': Decimal('0.115'),
         'deadline': deadline, **overrides,

@@ -18,8 +18,6 @@ def plot(ref, county, owner):
 
 class RateScheduleTests(APITestCase):
     def setUp(self):
-        County.objects.create(name='Nyeri County')
-        County.objects.create(name='Kiambu County')
         self.admin = User.objects.create_user('nyeri_admin', 'n@example.com', 'Password123!', role='admin', county='Nyeri')
         owner = User.objects.create_user('kamau', 'k@example.com', 'Password123!', county='Nyeri')
         self.paid_plot = plot('N1', 'Nyeri County', owner)
