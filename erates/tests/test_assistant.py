@@ -80,7 +80,9 @@ class AssistantTests(APITestCase):
         self.assertEqual(events[0]['sources'], [{'tool': 'ward_parcels', 'args': {'ward': 'karura'}}])
         prompt = json.dumps(llm.call_args.args[0])
         self.assertNotIn('0712345678', prompt)
-        self.assertNotIn('wanjiru', prompt)
+        self.assertNotIn('w@example.com', prompt)
+        allocated = {p['plot']: p['owner'] for p in self.facts(llm)['snapshot']['allocated_parcels']}
+        self.assertEqual(allocated, {'1865': 'wanjiru', '317': 'wanjiru'})
 
     def test_a_bare_follow_up_reuses_the_previous_question(self):
         history = [{'role': 'user', 'text': 'do we have any data on Nyeri county'}, {'role': 'assistant', 'text': 'Which year?'}]

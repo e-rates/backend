@@ -93,6 +93,10 @@ def snapshot(county):
         'wards': parcels.exclude(ward__isnull=True).exclude(ward='').values('ward').distinct().count(),
         'rate_bills': bills.count(),
         'paid_bills': bills.filter(status='completed').count(),
+        'allocated_parcels': [
+            {'plot': p.parcel_ref, 'ward': p.ward, 'land_use': p.land_use, 'area_m2': round(p.area_m2 or 0), 'owner': p.owner_user.username}
+            for p in parcels.filter(owner_user__isnull=False).select_related('owner_user')[:10]
+        ],
     }
 
 
