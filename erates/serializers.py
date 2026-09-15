@@ -8,6 +8,7 @@ import re
 from drf_spectacular.utils import extend_schema_field
 
 from .models import (
+    Conversation,
     RateSchedule,
     User, Account, County, Parcel, ParcelDeletionRequest, ParcelHistory, 
     LedgerEntry, Payment, AuditLog, phone_lookup_hash
@@ -702,19 +703,10 @@ class DefaultersSummarySerializer(serializers.Serializer):
     defaulters = serializers.ListField(child=DefaulterSerializer())
 
 
-class ChatTurnSerializer(serializers.Serializer):
-    """One earlier turn of the same conversation."""
-    role = serializers.ChoiceField(choices=['user', 'assistant'])
-    text = serializers.CharField(allow_blank=True, trim_whitespace=True)
-
-
 class LLMQuerySerializer(serializers.Serializer):
     """Serializer for LLM queries"""
     query = serializers.CharField(required=True, help_text="The question to ask the LLM")
-    history = ChatTurnSerializer(
-        many=True, required=False, max_length=6,
-        help_text="Recent turns, oldest first, so follow-up questions make sense",
-    )
+    conversation = serializers.UUIDField(required=False, help_text="Continue this conversation; omit to start a new one")
 
 
 
@@ -805,3 +797,15 @@ class RateScheduleSerializer(serializers.ModelSerializer):
             {'max_ha': format(b['max_ha'].normalize(), 'f'), 'amount': format(b['amount'].normalize(), 'f')}
             for b in sorted(value, key=lambda b: b['max_ha'])
         ]
+
+
+class ConversationSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Conversation
+        fields = ['conversation_id', 'title', 'updated_at']
+
+
+class ConversationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Conversation
+        fields = ['conversation_id', 'title', 'messages', 'created_at', 'updated_at']

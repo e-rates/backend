@@ -15,6 +15,7 @@ from .views import (
     ReportsViewSet,
     LLMQueryView,
     RateScheduleViewSet,
+    ConversationViewSet,
 )
 
 router = DefaultRouter()
@@ -29,6 +30,7 @@ router.register(r'audit-logs', AuditLogViewSet)
 router.register(r'counties', CountyViewSet)
 router.register(r'reports', ReportsViewSet, basename='reports')
 router.register(r'rate-schedules', RateScheduleViewSet, basename='rate-schedules')
+router.register(r'conversations', ConversationViewSet, basename='conversations')
 
 # Admin router (same viewsets, just different URL prefix for frontend compatibility)
 admin_router = DefaultRouter()

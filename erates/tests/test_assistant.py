@@ -8,7 +8,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from erates import assistant
-from erates.models import Parcel, Payment, User
+from erates.models import Conversation, Parcel, Payment, User
 from erates.tests.billing import bill_everyone
 
 
@@ -40,12 +40,12 @@ class AssistantTests(APITestCase):
         Payment.objects.filter(parcel__parcel_ref__in=['317', '900']).update(deadline=timezone.now() - timedelta(days=10))
         self.client.force_authenticate(self.official)
 
-    def ask(self, question, history=None, model=_model_reply):
-        body = {'query': question, **({'history': history} if history else {})}
+    def ask(self, question, conversation=None, model=_model_reply):
+        body = {'query': question, **({'conversation': str(conversation.pk)} if conversation else {})}
         with mock.patch.object(assistant, '_stream_llm', side_effect=model) as llm:
             resp = self.client.post('/api/llm/analyze/', body, format='json')
             events = [json.loads(line) for line in b''.join(resp.streaming_content).decode().splitlines()]
-        return events, llm
+        return events[1:], llm
 
     @staticmethod
     def text(events):
@@ -88,7 +88,7 @@ class AssistantTests(APITestCase):
 
     def test_a_bare_follow_up_reuses_the_previous_question(self):
         history = [{'role': 'user', 'text': 'do we have any data on Nyeri county'}, {'role': 'assistant', 'text': 'Which year?'}]
-        events, _ = self.ask('2026', history=history)
+        events, _ = self.ask('2026', conversation=Conversation.objects.create(user=self.official, title='Nyeri', messages=history))
         self.assertEqual(events[0]['sources'], [{'tool': 'collections_summary', 'args': {'year': 2026}}])
 
     def test_superadmin_can_list_counties(self):
@@ -161,16 +161,11 @@ class AssistantTests(APITestCase):
             {'role': 'user', 'text': 'Who owns plot 1865?'},
             {'role': 'assistant', 'text': 'x' * 1000 + ' Plot 1865 belongs to wanjiru.'},
         ]
-        _, llm = self.ask('who are you', history=history)
+        _, llm = self.ask('who are you', conversation=Conversation.objects.create(user=self.official, title='x', messages=history))
         messages = llm.call_args.args[0]
         self.assertEqual(messages[1], {'role': 'user', 'content': 'Who owns plot 1865?'})
         self.assertEqual(len(messages[2]['content']), assistant.MAX_HISTORY_CHARS)
         self.assertTrue(messages[2]['content'].endswith('belongs to wanjiru.'))
-
-    def test_history_longer_than_the_cap_is_rejected(self):
-        history = [{'role': 'user', 'text': f'q{i}'} for i in range(7)]
-        resp = self.client.post('/api/llm/analyze/', {'query': 'x', 'history': history}, format='json')
-        self.assertEqual(resp.status_code, 400)
 
     def test_ratepayers_cannot_use_assistant(self):
         self.client.force_authenticate(User.objects.get(username='wanjiru'))

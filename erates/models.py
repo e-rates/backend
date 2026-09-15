@@ -731,3 +731,18 @@ class RateSchedule(SecurityMixin):
 
     def __str__(self):
         return f"{self.county.name} {self.year}"
+
+
+class Conversation(SecurityMixin):
+    """One official's chat with the assistant, kept so they can return to it."""
+    conversation_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='conversations')
+    title = models.CharField(max_length=120)
+    messages = models.JSONField(default=list)
+
+    class Meta:
+        db_table = 'conversations'
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return self.title

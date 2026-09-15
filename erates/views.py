@@ -26,6 +26,7 @@ from drf_spectacular.types import OpenApiTypes
 from rest_framework import serializers as drf_serializers
 
 from .models import (
+    Conversation,
     RateSchedule,
     User,
     Account,
@@ -38,6 +39,8 @@ from .models import (
     AuditLog,
 )
 from .serializers import (
+    ConversationSerializer,
+    ConversationSummarySerializer,
     RateScheduleSerializer,
     CountySerializer,
     
@@ -2731,6 +2734,22 @@ def _ndjson(events):
     return response
 
 
+def _recorded(conversation, query, events):
+    yield {'conversation': str(conversation.pk), 'title': conversation.title}
+    answer, sources, error = '', [], None
+    for event in events:
+        answer += event.get('text', '')
+        sources = event.get('sources', sources)
+        error = event.get('error', error)
+        yield event
+    conversation.messages = [
+        *conversation.messages,
+        {'role': 'user', 'text': query},
+        {'role': 'assistant', 'text': answer, 'sources': sources, **({'error': error} if error else {})},
+    ]
+    conversation.save()
+
+
 class LLMQueryView(APIView):
     """Answers from county-scoped data tools, then streams the model's commentary."""
     permission_classes = [IsAdminOrAuditor]
@@ -2753,6 +2772,13 @@ class LLMQueryView(APIView):
         serializer.is_valid(raise_exception=True)
         query = serializer.validated_data['query']
         query_clean = query.strip().lower()
+        conversation_id = serializer.validated_data.get('conversation')
+        if conversation_id:
+            conversation = Conversation.objects.filter(pk=conversation_id, user=request.user, is_deleted=False).first()
+            if not conversation:
+                return Response({'error': 'Conversation not found'}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            conversation = Conversation.objects.create(user=request.user, title=' '.join(query.split())[:120])
 
         is_superadmin = bool(request.user.is_superuser or getattr(request.user, 'role', None) == 'owner')
         user_county = (getattr(request.user, 'county', None) or '').strip().title() or None
@@ -2764,34 +2790,34 @@ class LLMQueryView(APIView):
         if is_superadmin:
             county = detected_county
         elif not user_county:
-            return _ndjson([{'text': (
+            return _ndjson(_recorded(conversation, query, [{'text': (
                 "⚠️ **Access Restricted**: Your user account is not assigned to a county jurisdiction. "
                 "Please contact the platform super administrator."
-            )}])
+            )}]))
         elif detected_county and detected_county.lower() != user_county.lower():
-            return _ndjson([{'text': (
+            return _ndjson(_recorded(conversation, query, [{'text': (
                 f"⛔ **Access Denied: Cross-County Restriction**\n\n"
                 f"You are authenticated as an official of **{user_county} County**. "
                 f"Under statutory county data protection policies, you are not authorized to query or view records for **{detected_county} County**.\n\n"
                 f"- **Your Authorized County:** {user_county}\n"
                 f"- **Attempted County:** {detected_county}\n"
                 f"- Cross-county and national queries can only be executed by platform super administrators."
-            )}])
+            )}]))
         elif any(phrase in query_clean for phrase in MULTI_COUNTY_PHRASES):
-            return _ndjson([{'text': (
+            return _ndjson(_recorded(conversation, query, [{'text': (
                 f"⛔ **Access Denied: Multi-County Restriction**\n\n"
                 f"You are authorized to access data for **{user_county} County** only. "
                 f"Platform-wide aggregations across all counties are restricted to platform super administrators."
-            )}])
+            )}]))
         else:
             county = user_county
 
-        return _ndjson(assistant.stream(
+        return _ndjson(_recorded(conversation, query, assistant.stream(
             query,
-            history=serializer.validated_data.get('history'),
+            history=conversation.messages,
             county=county,
             user=request.user,
-        ))
+        )))
 
 
 class ParcelDeletionRequestViewSet(mixins.ListModelMixin,
@@ -2874,7 +2900,9 @@ class ParcelDeletionRequestViewSet(mixins.ListModelMixin,
 class RateScheduleViewSet(viewsets.GenericViewSet):
     """County rates per rating year; issuing a schedule bills every owned parcel in that county."""
     serializer_class = RateScheduleSerializer
-    permission_classes = [IsAdmin]
+
+    def get_permissions(self):
+        return [IsAdminOrAuditor()] if self.action == 'list' else [IsAdmin()]
 
     def _county(self, request):
         name = scope_county(request) or request.data.get('county') or request.query_params.get('county')
@@ -2922,3 +2950,18 @@ class RateScheduleViewSet(viewsets.GenericViewSet):
             {**outcome, 'county': county.name, 'schedule': self.get_serializer(schedule).data},
             status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED,
         )
+
+
+class ConversationViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet):
+    """An official's saved assistant conversations; nobody else can read them."""
+    permission_classes = [IsAdminOrAuditor]
+    pagination_class = None
+
+    def get_queryset(self):
+        return Conversation.objects.filter(user=self.request.user, is_deleted=False)
+
+    def get_serializer_class(self):
+        return ConversationSummarySerializer if self.action == 'list' else ConversationSerializer
+
+    def perform_destroy(self, instance):
+        instance.soft_delete()
