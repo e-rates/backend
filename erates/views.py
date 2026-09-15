@@ -2062,8 +2062,14 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ['created_at', 'audit_id']
     permission_classes = [permissions.IsAuthenticated, IsAdminOrAuditor]
 
+    def _visible(self, queryset):
+        if self.request.user.is_platform_owner:
+            return queryset
+        return queryset.exclude(action__startswith='auth.').exclude(
+            Q(who__role='owner') | Q(who__is_superuser=True))
+
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = self._visible(super().get_queryset())
         category = self.request.query_params.get('category')
         if category in audit.CATEGORIES:
             queryset = queryset.filter(action__startswith=f'{category}.')
@@ -2078,7 +2084,7 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     @extend_schema(summary="Audit event counts per category", tags=['Audit'])
     @action(detail=False, methods=['get'])
     def summary(self, request):
-        base = AuditLog.objects.all()
+        base = self._visible(AuditLog.objects.all())
         counts = {key: base.filter(action__startswith=f'{key}.').count() for key in audit.CATEGORIES}
         return Response({
             'categories': [{'key': k, 'label': label, 'count': counts[k]} for k, label in audit.CATEGORIES.items()],

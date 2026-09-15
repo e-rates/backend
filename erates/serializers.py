@@ -512,6 +512,8 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
 class AuditLogSerializer(serializers.ModelSerializer):
 
     who_username = serializers.CharField(source='who.username', read_only=True, default=None)
+    who_email = serializers.CharField(source='who.email', read_only=True, default=None)
+    who_role = serializers.CharField(source='who.role', read_only=True, default=None)
     summary = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
     integrity_verified = serializers.SerializerMethodField()
@@ -519,7 +521,7 @@ class AuditLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = AuditLog
         fields = [
-            'audit_id', 'who', 'who_username', 'action', 'category', 'summary',
+            'audit_id', 'who', 'who_username', 'who_email', 'who_role', 'action', 'category', 'summary',
             'object_type', 'object_id', 'ip_address', 'user_agent',
             'details', 'integrity_verified', 'created_at'
         ]
@@ -728,8 +730,7 @@ class CountySerializer(serializers.ModelSerializer):
     def get_logo_url(self, obj) -> str:
         if not obj.logo:
             return None
-        request = self.context.get('request')
-        return request.build_absolute_uri(obj.logo.url) if request else obj.logo.url
+        return obj.logo.url
 
     def validate_name(self, value):
         name = ' '.join(value.split()).title()
