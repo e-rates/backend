@@ -28,6 +28,7 @@ from rest_framework import serializers as drf_serializers
 from .models import (
     Conversation,
     RateSchedule,
+    Waiver,
     User,
     Account,
     County,
@@ -42,6 +43,7 @@ from .serializers import (
     ConversationSerializer,
     ConversationSummarySerializer,
     RateScheduleSerializer,
+    WaiverSerializer,
     CountySerializer,
     
     UserListSerializer,
@@ -77,7 +79,7 @@ from .serializers import (
     DefaulterSerializer,
     LLMQuerySerializer,
 )
-from . import audit, mpesa, parcel_deletion, payment_flow, rate_reports
+from . import audit, mpesa, parcel_deletion, payment_flow, rate_reports, waivers
 from .counties import KENYA_COUNTIES
 import hmac
 
@@ -1218,6 +1220,7 @@ class ParcelViewSet(viewsets.ModelViewSet):
                 'basis': (bill.metadata or {}).get('basis'),
                 'explanation': (bill.metadata or {}).get('explanation'),
                 'standard_amount': (bill.metadata or {}).get('standard_amount'),
+                'waiver': (bill.metadata or {}).get('waiver'),
                 'paid_at': bill.updated_at.isoformat() if bill.status == 'completed' else None,
             },
         }
@@ -2944,6 +2947,92 @@ class RateScheduleViewSet(viewsets.GenericViewSet):
             {**outcome, 'county': county.name, 'schedule': self.get_serializer(schedule).data},
             status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED,
         )
+
+
+class WaiverViewSet(viewsets.GenericViewSet):
+    """County waivers: a percentage off the rate bills of the plots and years they cover, applied automatically."""
+    serializer_class = WaiverSerializer
+
+    def get_permissions(self):
+        if self.action == 'mine':
+            return [permissions.IsAuthenticated()]
+        return [IsAdminOrAuditor()] if self.action == 'list' else [IsAdmin()]
+
+    def _county(self, request):
+        name = scope_county(request) or request.data.get('county') or request.query_params.get('county')
+        county = find_county(name) if name else None
+        if not county:
+            raise ValidationError({'county': 'Choose a county that is on the platform.'})
+        return county
+
+    def _draft(self, request):
+        county = self._county(request)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return county, serializer
+
+    @extend_schema(summary="A county's waivers", tags=['Billing'])
+    def list(self, request):
+        rows = Waiver.objects.filter(county=self._county(request), is_deleted=False).select_related(
+            'county', 'created_by', 'revoked_by')
+        return Response(self.get_serializer(rows, many=True).data)
+
+    @extend_schema(summary="Bills a draft waiver would reduce, without saving it", tags=['Billing'])
+    @action(detail=False, methods=['post'])
+    def preview(self, request):
+        county, serializer = self._draft(request)
+        return Response({**waivers.impact(Waiver(county=county, **serializer.validated_data)), 'county': county.name})
+
+    @extend_schema(summary="Create a waiver and apply it to open bills", tags=['Billing'])
+    def create(self, request):
+        from django.db import transaction
+
+        county, serializer = self._draft(request)
+        with transaction.atomic():
+            waiver = serializer.save(county=county, created_by=request.user)
+            outcome = waivers.impact(waiver)
+            waiver.bills_affected, waiver.amount_waived = outcome['bills'], Decimal(outcome['amount_waived'])
+            waiver.save(update_fields=['bills_affected', 'amount_waived', 'updated_at'])
+            waivers.apply_waivers(county)
+            audit.record('waiver.created', obj=waiver, object_type='waiver', county=county.name, name=waiver.name,
+                         percent=str(waiver.percent), years=waiver.years, sub_counties=waiver.sub_counties,
+                         wards=waiver.wards, land_uses=waiver.land_uses, parcel_refs=waiver.parcel_refs,
+                         starts_on=waiver.starts_on.isoformat(),
+                         ends_on=waiver.ends_on.isoformat() if waiver.ends_on else None, **outcome)
+        return Response(self.get_serializer(waiver).data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(summary="Revoke a waiver; its bills return to the full amount", tags=['Billing'])
+    @action(detail=True, methods=['post'])
+    def revoke(self, request, pk=None):
+        from django.db import transaction
+
+        waiver = Waiver.objects.filter(pk=pk, county=self._county(request), is_deleted=False).first()
+        if waiver is None:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if waiver.revoked_at:
+            raise ValidationError({'detail': 'This waiver is already revoked.'})
+        with transaction.atomic():
+            waiver.revoked_at, waiver.revoked_by = timezone.now(), request.user
+            waiver.save(update_fields=['revoked_at', 'revoked_by', 'updated_at'])
+            outcome = waivers.apply_waivers(waiver.county)
+            audit.record('waiver.revoked', obj=waiver, object_type='waiver', county=waiver.county.name,
+                         name=waiver.name, **outcome)
+        return Response(self.get_serializer(waiver).data)
+
+    @extend_schema(summary="Waivers covering the signed-in landowner's plots", tags=['Billing'])
+    @action(detail=False, methods=['get'])
+    def mine(self, request):
+        parcels = list(Parcel.objects.filter(owner_user=request.user, is_deleted=False))
+        rows = []
+        for waiver in Waiver.objects.filter(revoked_at__isnull=True, is_deleted=False).select_related('county'):
+            plots = [p.parcel_ref for p in parcels
+                     if find_county(p.county) == waiver.county and waivers.covers(waiver, p)]
+            if plots:
+                data = self.get_serializer(waiver).data
+                rows.append({key: data[key] for key in (
+                    'waiver_id', 'county', 'name', 'legal_reference', 'percent', 'years', 'starts_on', 'ends_on', 'status',
+                )} | {'plots': plots})
+        return Response(rows)
 
 
 class ConversationViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet):

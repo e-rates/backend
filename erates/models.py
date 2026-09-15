@@ -733,6 +733,34 @@ class RateSchedule(SecurityMixin):
         return f"{self.county.name} {self.year}"
 
 
+class Waiver(SecurityMixin):
+    """A county's percentage relief on rate bills for the plots and years it covers."""
+    waiver_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    county = models.ForeignKey(County, on_delete=models.PROTECT, related_name='waivers')
+    name = models.CharField(max_length=200)
+    legal_reference = models.CharField(max_length=255, blank=True, default='')
+    percent = models.DecimalField(max_digits=5, decimal_places=2)
+    years = models.JSONField(default=list, blank=True)
+    sub_counties = models.JSONField(default=list, blank=True)
+    wards = models.JSONField(default=list, blank=True)
+    land_uses = models.JSONField(default=list, blank=True)
+    parcel_refs = models.JSONField(default=list, blank=True)
+    starts_on = models.DateField()
+    ends_on = models.DateField(null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name='waivers_created', null=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name='waivers_revoked', null=True, blank=True)
+    bills_affected = models.IntegerField(default=0)
+    amount_waived = models.DecimalField(max_digits=20, decimal_places=2, default=0)
+
+    class Meta:
+        db_table = 'waivers'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.county.name}: {self.name} ({self.percent}%)"
+
+
 class Conversation(SecurityMixin):
     """One official's chat with the assistant, kept so they can return to it."""
     conversation_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

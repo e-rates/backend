@@ -5,7 +5,7 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
-from . import audit, mpesa
+from . import audit, mpesa, waivers
 from .models import Account, MpesaTransaction, Parcel, Payment
 from .rate_reports import county_q
 from .rates import annual_rate, rate_basis, rate_explanation
@@ -27,12 +27,14 @@ def generate_rate_bills(schedule, dry_run=False) -> dict:
     ).select_related('owner_user')
     created = updated = unchanged = 0
     total = Decimal(0)
+    active = waivers.active_waivers(schedule.county)
     for parcel in parcels:
         amount = annual_rate(parcel, schedule)
         total += amount
+        waiver = waivers.best(active, parcel, schedule.year)
         metadata = {
             'kind': 'land_rates', 'basis': rate_basis(parcel), 'land_use': parcel.land_use,
-            'explanation': rate_explanation(parcel, schedule), 'standard_amount': str(amount),
+            'explanation': rate_explanation(parcel, schedule),
         }
         bill = Payment.objects.filter(parcel=parcel, payment_year=schedule.year).first()
         if bill is None:
@@ -41,17 +43,23 @@ def generate_rate_bills(schedule, dry_run=False) -> dict:
                 account, _ = Account.objects.get_or_create(
                     owner_user=parcel.owner_user, account_type='main', defaults={'currency': 'KES'},
                 )
-                Payment.objects.create(
+                bill = Payment(
                     idempotency_key=f'rates:{parcel.parcel_ref}:{schedule.year}',
                     user=parcel.owner_user, account=account, parcel=parcel, payment_year=schedule.year,
                     amount=amount, deadline=schedule.deadline, metadata=metadata,
                 )
-        elif bill.status in UNPAID and (bill.amount != amount or bill.deadline != schedule.deadline):
-            updated += 1
-            if not dry_run:
-                bill.amount, bill.deadline = amount, schedule.deadline
-                bill.metadata = {**(bill.metadata or {}), **metadata}
+                waivers.settle(bill, amount, waiver)
                 bill.save()
+        elif bill.status in UNPAID or waivers.is_waived_off(bill):
+            moved = bill.deadline != schedule.deadline
+            bill.deadline = schedule.deadline
+            bill.metadata = {**(bill.metadata or {}), **metadata}
+            if waivers.settle(bill, amount, waiver) or moved:
+                updated += 1
+                if not dry_run:
+                    bill.save()
+            else:
+                unchanged += 1
         else:
             unchanged += 1
     if not dry_run and (created or updated):

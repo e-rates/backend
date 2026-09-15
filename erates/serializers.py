@@ -10,6 +10,7 @@ from drf_spectacular.utils import extend_schema_field
 from .models import (
     Conversation,
     RateSchedule,
+    Waiver,
     User, Account, County, Parcel, ParcelDeletionRequest, ParcelHistory, 
     LedgerEntry, Payment, AuditLog, phone_lookup_hash
 )
@@ -809,3 +810,57 @@ class ConversationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Conversation
         fields = ['conversation_id', 'title', 'messages', 'created_at', 'updated_at']
+
+
+class WaiverSerializer(serializers.ModelSerializer):
+    county = serializers.CharField(source='county.name', read_only=True)
+    created_by = serializers.CharField(source='created_by.username', read_only=True, default=None)
+    revoked_by = serializers.CharField(source='revoked_by.username', read_only=True, default=None)
+    status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Waiver
+        fields = [
+            'waiver_id', 'county', 'name', 'legal_reference', 'percent', 'years', 'sub_counties', 'wards',
+            'land_uses', 'parcel_refs', 'starts_on', 'ends_on', 'status', 'created_by', 'created_at',
+            'revoked_by', 'revoked_at', 'bills_affected', 'amount_waived',
+        ]
+        read_only_fields = ['waiver_id', 'created_at', 'revoked_at', 'bills_affected', 'amount_waived']
+
+    def get_status(self, obj) -> str:
+        today = timezone.localdate()
+        if obj.revoked_at:
+            return 'revoked'
+        if obj.starts_on > today:
+            return 'scheduled'
+        return 'ended' if obj.ends_on and obj.ends_on < today else 'active'
+
+    def validate_percent(self, value):
+        if not Decimal(0) < value <= Decimal(100):
+            raise serializers.ValidationError('Waive between 0 and 100 percent.')
+        return value
+
+    def validate_years(self, value):
+        current = timezone.now().year
+        if not isinstance(value, list) or not all(isinstance(y, int) and current - 20 <= y <= current + 1 for y in value):
+            raise serializers.ValidationError(f'Years must be between {current - 20} and {current + 1}.')
+        return sorted(set(value))
+
+    def _names(self, value):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise serializers.ValidationError('Give a list of names.')
+        return sorted({v.strip() for v in value if v.strip()})
+
+    validate_sub_counties = validate_wards = validate_parcel_refs = _names
+
+    def validate_land_uses(self, value):
+        names = self._names(value)
+        allowed = {choice for choice, _ in Parcel._meta.get_field('land_use').choices}
+        if not set(names) <= allowed:
+            raise serializers.ValidationError(f'Land use must be one of {", ".join(sorted(allowed))}.')
+        return names
+
+    def validate(self, attrs):
+        if attrs.get('ends_on') and attrs['ends_on'] < attrs['starts_on']:
+            raise serializers.ValidationError({'ends_on': 'The waiver cannot end before it starts.'})
+        return attrs
