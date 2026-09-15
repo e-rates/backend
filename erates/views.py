@@ -1748,8 +1748,6 @@ class PaymentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], permission_classes=[IsAdminOrAuditor], url_path='ward-parcels')
     def ward_parcels(self, request):
         ward = (request.query_params.get('ward') or '').strip()
-        if not ward:
-            raise ValidationError({'ward': 'ward is required'})
         year = self._report_year(request)
         return Response({'year': year, 'ward': ward, 'parcels': rate_reports.ward_parcels(ward, year, scope_county(request))})
 

@@ -138,7 +138,10 @@ def ward_parcels(ward: str, year: int, county=None) -> list:
     parcels = Parcel.objects.filter(is_deleted=False, owner_user__isnull=False).select_related('owner_user')
     if county:
         parcels = parcels.filter(county_q('county', county))
-    parcels = parcels.filter(ward__isnull=True) if ward == 'unassigned' else parcels.filter(ward__iexact=ward)
+    if ward == 'unassigned':
+        parcels = parcels.filter(ward__isnull=True)
+    elif ward:
+        parcels = parcels.filter(ward__iexact=ward)
     parcels = list(parcels)
     bills = bills_for_year(year, [p.pk for p in parcels])
     rows = []
