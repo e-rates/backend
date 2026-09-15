@@ -2175,6 +2175,7 @@ class ReportsViewSet(viewsets.ViewSet):
             body = report_builders.render_xlsx(report, who)
             content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         response = HttpResponse(body, content_type=content_type)
+        response.xframe_options_exempt = True
         disposition = 'inline' if fmt == 'pdf' else 'attachment'
         response['Content-Disposition'] = f'{disposition}; filename="{report.slug}.{fmt}"'
         return response
@@ -2206,6 +2207,7 @@ class ReportsViewSet(viewsets.ViewSet):
         pdf_bytes = file_path.read_bytes()
         response = HttpResponse(pdf_bytes, content_type='application/pdf')
         response['Content-Disposition'] = f'inline; filename="{filename}"'
+        response.xframe_options_exempt = True
         return response
 
     permission_classes = [permissions.IsAuthenticated, IsAdminOrAuditor]
