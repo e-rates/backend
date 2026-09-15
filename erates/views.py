@@ -10,9 +10,11 @@ from django.db.models.functions import TruncDate, TruncMonth, TruncWeek
 from django.utils import timezone
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import json
 import re
 import secrets
 from django.conf import settings
+from django.http import StreamingHttpResponse
 from drf_spectacular.utils import (
     extend_schema,
     extend_schema_view,
@@ -2710,401 +2712,85 @@ class ReportsViewSet(viewsets.ViewSet):
         
         return response
 
+COUNTY_NAMES = (
+    'nyeri', 'nairobi', 'kiambu', 'nakuru', 'mombasa', 'kisumu', 'machakos',
+    'kilifi', 'uasin gishu', 'meru', 'embu', "murang'a", 'kajiado', 'laikipia',
+    'garissa', 'kakamega', 'kisii', 'narok', 'kericho', 'bungoma', 'turkana',
+)
+MULTI_COUNTY_PHRASES = ('all counties', 'every county', 'across counties', 'national', 'countrywide', 'all county', 'other counties')
+
+
+def _ndjson(events):
+    response = StreamingHttpResponse(
+        (json.dumps(event, default=str) + '\n' for event in events),
+        content_type='application/x-ndjson',
+    )
+    response['X-Accel-Buffering'] = 'no'
+    response['Cache-Control'] = 'no-cache'
+    return response
+
+
 class LLMQueryView(APIView):
-    """
-    View to handle queries with intelligent dispatch to:
-    - Official PDF Report generation
-    - Unpaid / Defaulters drilldown
-    - IBM Granite SLM county reconciliation table
-    - Assistant tool fallback
-    """
+    """Answers from county-scoped data tools, then streams the model's commentary."""
     permission_classes = [IsAdminOrAuditor]
     serializer_class = LLMQuerySerializer
 
     @extend_schema(
         summary="Ask the E-Rates assistant",
-        description="Handles natural language inquiries, generates official PDF reports, and queries live land/compliance records.",
+        description="Streams newline-delimited JSON: {text, sources} with the data tables first, then {text} deltas, or {error}.",
         tags=['LLM'],
         request=LLMQuerySerializer,
         responses={
-            200: OpenApiResponse(description="{answer, sources, used_fallback}"),
+            200: OpenApiResponse(description="application/x-ndjson stream"),
             400: OpenApiResponse(description="Invalid request"),
-            502: OpenApiResponse(description="Language model unreachable or failed"),
-            503: OpenApiResponse(description="LLM_API_URL not configured"),
         },
     )
     def post(self, request):
+        from . import assistant
+
         serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
         query = serializer.validated_data['query']
         query_clean = query.strip().lower()
 
-        # 1. Friendly greeting handling
-        if query_clean in ('hey', 'hello', 'hi', 'howdy', 'greetings', 'help', 'hey there'):
-            return Response({
-                "answer": "Hello! I am your E-Rates assistant powered by IBM Granite. Ask me about parcel compliance, revenue collections, or generate official statutory reports.",
-                "sources": [],
-                "used_fallback": False,
-            })
-
-        # 2. RBAC & Jurisdiction Detection
-        is_superadmin = bool(
-            request.user.is_superuser or 
-            getattr(request.user, 'role', None) == 'owner'
+        is_superadmin = bool(request.user.is_superuser or getattr(request.user, 'role', None) == 'owner')
+        user_county = (getattr(request.user, 'county', None) or '').strip().title() or None
+        detected_county = next(
+            (name.title() for name in COUNTY_NAMES if re.search(rf'\b{re.escape(name)}\b', query_clean)),
+            None,
         )
-        user_county = getattr(request.user, 'county', None)
-        user_county = user_county.strip().title() if user_county and user_county.strip() else None
 
-        # Detect county explicitly mentioned in user prompt
-        COMMON_COUNTIES = (
-            'nyeri', 'nairobi', 'kiambu', 'nakuru', 'mombasa', 'kisumu', 'machakos',
-            'kilifi', 'uasin gishu', 'meru', 'embu', 'murang\'a', 'kajiado', 'laikipia',
-            'garissa', 'kakamega', 'kisii', 'narok', 'kericho', 'bungoma', 'turkana'
-        )
-        detected_county = None
-        for c_name in COMMON_COUNTIES:
-            if c_name in query_clean:
-                detected_county = c_name.title()
-                break
-
-        if not detected_county and extract_intent:
-            try:
-                intent_data = extract_intent(query)
-                extracted = intent_data.get("arguments", {}).get("county")
-                if extracted and isinstance(extracted, str) and extracted.lower() not in ('null', 'none', ''):
-                    detected_county = extracted.strip().title()
-            except Exception:
-                pass
-
-        # RBAC Check: Non-superadmin is restricted to their assigned county ONLY
-        if not is_superadmin:
-            if not user_county:
-                return Response({
-                    "answer": "⚠️ **Access Restricted**: Your user account is not assigned to a county jurisdiction. Please contact the platform super administrator.",
-                    "sources": [],
-                    "used_fallback": False,
-                })
-
-            # Check if user explicitly asked about another county
-            if detected_county and detected_county.lower() != user_county.lower():
-                return Response({
-                    "answer": (
-                        f"⛔ **Access Denied: Cross-County Restriction**\n\n"
-                        f"You are authenticated as an official of **{user_county} County**. "
-                        f"Under statutory county data protection policies, you are not authorized to query or view records for **{detected_county} County**.\n\n"
-                        f"- **Your Authorized County:** {user_county}\n"
-                        f"- **Attempted County:** {detected_county}\n"
-                        f"- Cross-county and national queries can only be executed by platform super administrators."
-                    ),
-                    "sources": [],
-                    "used_fallback": False,
-                })
-
-            # Check if user asked for all counties / national figures
-            if any(p in query_clean for p in ('all counties', 'every county', 'across counties', 'national', 'countrywide', 'all county', 'other counties')):
-                return Response({
-                    "answer": (
-                        f"⛔ **Access Denied: Multi-County Restriction**\n\n"
-                        f"You are authorized to access data for **{user_county} County** only. "
-                        f"Platform-wide aggregations across all counties are restricted to platform super administrators."
-                    ),
-                    "sources": [],
-                    "used_fallback": False,
-                })
-
-            # County officials are strictly locked to their assigned county
-            county = user_county
-        else:
-            # Platform Superadmin / Owner can query any county, or all counties if none specified
+        if is_superadmin:
             county = detected_county
+        elif not user_county:
+            return _ndjson([{'text': (
+                "⚠️ **Access Restricted**: Your user account is not assigned to a county jurisdiction. "
+                "Please contact the platform super administrator."
+            )}])
+        elif detected_county and detected_county.lower() != user_county.lower():
+            return _ndjson([{'text': (
+                f"⛔ **Access Denied: Cross-County Restriction**\n\n"
+                f"You are authenticated as an official of **{user_county} County**. "
+                f"Under statutory county data protection policies, you are not authorized to query or view records for **{detected_county} County**.\n\n"
+                f"- **Your Authorized County:** {user_county}\n"
+                f"- **Attempted County:** {detected_county}\n"
+                f"- Cross-county and national queries can only be executed by platform super administrators."
+            )}])
+        elif any(phrase in query_clean for phrase in MULTI_COUNTY_PHRASES):
+            return _ndjson([{'text': (
+                f"⛔ **Access Denied: Multi-County Restriction**\n\n"
+                f"You are authorized to access data for **{user_county} County** only. "
+                f"Platform-wide aggregations across all counties are restricted to platform super administrators."
+            )}])
+        else:
+            county = user_county
 
-        year = timezone.now().year
-        now = timezone.now()
-
-        # 3. Check if user wants a downloadable PDF report
-        wants_report = any(w in query_clean for w in ('report', 'pdf', 'export', 'download', 'generate'))
-        if wants_report:
-            from .assistant import tool_generate_report_pdf
-            if any(w in query_clean for w in ('unpaid', 'upaid', 'defaulter', 'defaulters', 'arrear', 'arrears', 'overdue', 'debt')):
-                rep_type = 'arrears'
-            elif any(w in query_clean for w in ('register', 'plot', 'parcel', 'boundary')):
-                rep_type = 'register'
-            else:
-                rep_type = 'collections'
-
-            target_county = county or user_county or 'Nyeri'
-            try:
-                pdf_data = tool_generate_report_pdf({
-                    'report_type': rep_type,
-                    'year': year,
-                    'county': target_county,
-                }, user=request.user)
-
-                title = pdf_data.get('title', 'Official Report')
-                download_url = pdf_data.get('download_url', '')
-
-                unpaid_count = Payment.objects.filter(
-                    county_q('parcel__county', target_county),
-                    deadline__lt=now,
-                    is_deleted=False,
-                ).exclude(status__in=['completed', 'refunded']).count()
-
-                answer = (
-                    f"### {title} — {target_county} County\n\n"
-                    f"I have compiled the official **{title}** for **{target_county} County** ({year}). "
-                    f"The document includes property breakdowns, statutory compliance records, and valuation rolls.\n\n"
-                    f"[{title}]({download_url})\n\n"
-                    f"- **County:** {target_county}\n"
-                    f"- **Rating Year:** {year}\n"
-                    f"- **Total Identified Defaulters:** {unpaid_count}\n"
-                    f"- **Status:** Official PDF compiled and ready for download."
-                )
-
-                return Response({
-                    "answer": answer,
-                    "sources": [
-                        {"tool": "generate_report_pdf", "args": {"county": target_county, "report_type": rep_type, "year": year}},
-                        {"tool": "defaulters" if rep_type == 'arrears' else "collections", "args": {"county": target_county, "year": year}},
-                    ],
-                    "used_fallback": False,
-                })
-            except Exception:
-                pass
-
-        # 4. Check if user asks for multi-year rates summary or years with unpaid bills
-        wants_years = any(w in query_clean for w in ('year', 'years')) and any(
-            w in query_clean for w in ('unpaid', 'bill', 'bills', 'arrear', 'arrears', 'due', 'outstanding', 'summary', 'history', 'breakdown', 'all', 'rate', 'rates')
-        )
-        if wants_years:
-            from . import rate_reports
-            try:
-                rows = rate_reports.years(county=county)
-                if rows:
-                    table_lines = [
-                        "| Rating Year | Total Bills | Paid | Unpaid | Total Billed | Collected | Outstanding Arrears | Status |",
-                        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-                    ]
-                    total_billed = Decimal(0)
-                    total_collected = Decimal(0)
-                    total_outstanding = Decimal(0)
-                    years_with_unpaid = []
-
-                    for r in sorted(rows, key=lambda x: x['year'], reverse=True):
-                        yr = r['year']
-                        bills = r['bills']
-                        paid = r['paid_bills']
-                        unpaid = r['unpaid_bills']
-                        billed = r['billed']
-                        collected = r['collected']
-                        outstanding = r['outstanding']
-
-                        total_billed += billed
-                        total_collected += collected
-                        total_outstanding += outstanding
-
-                        if unpaid > 0:
-                            status_str = f"⚠️ {unpaid} Unpaid"
-                            years_with_unpaid.append(str(yr))
-                        else:
-                            status_str = "✅ Fully Cleared"
-
-                        table_lines.append(
-                            f"| **{yr}** | {bills:,} | {paid:,} | {unpaid:,} | KES {billed:,.2f} | KES {collected:,.2f} | KES {outstanding:,.2f} | {status_str} |"
-                        )
-
-                    table_md = "\n".join(table_lines)
-                    scope_str = f" for **{county} County**" if county else " across all registered counties"
-                    unpaid_str = ", ".join(years_with_unpaid) if years_with_unpaid else "None"
-
-                    answer = (
-                        f"### Annual Land Rates & Arrears Summary{scope_str}\n\n"
-                        f"{table_md}\n\n"
-                        f"**Key Insights:**\n"
-                        f"- **Years with Unpaid Bills:** {unpaid_str}\n"
-                        f"- **Total Billed:** KES {total_billed:,.2f}\n"
-                        f"- **Total Collected:** KES {total_collected:,.2f}\n"
-                        f"- **Total Outstanding Arrears:** KES {total_outstanding:,.2f}\n"
-                    )
-                else:
-                    scope_str = f" for **{county} County**" if county else ""
-                    answer = (
-                        f"### Annual Land Rates & Arrears Summary{scope_str}\n\n"
-                        f"There are currently **no billing records** found in the database{scope_str}."
-                    )
-
-                return Response({
-                    "answer": answer,
-                    "sources": [{"tool": "years_summary", "args": {"county": county or "all"}}],
-                    "used_fallback": False,
-                })
-            except Exception:
-                pass
-
-        # 5. Check if user asked specifically for unpaid parcels / defaulters list
-        wants_defaulters = any(w in query_clean for w in ('unpaid', 'upaid', 'defaulter', 'defaulters', 'arrear', 'arrears', 'overdue', 'debt', 'owing'))
-        if wants_defaulters:
-            try:
-                defaulters_qs = Payment.objects.filter(
-                    deadline__lt=now,
-                    is_deleted=False,
-                ).exclude(status__in=['completed', 'refunded']).select_related('parcel', 'user')
-
-                if county:
-                    defaulters_qs = defaulters_qs.filter(county_q('parcel__county', county))
-
-                defaulters_qs = defaulters_qs[:20]
-
-                scope_label = f" — {county} County" if county else " — All Counties"
-                if defaulters_qs.exists():
-                    rows = []
-                    for b in defaulters_qs:
-                        ref = b.parcel.parcel_ref if b.parcel else 'N/A'
-                        c_name = b.parcel.county if b.parcel and not county else ''
-                        ward = b.parcel.ward if b.parcel and b.parcel.ward else 'N/A'
-                        owner = b.user.username if b.user else 'Unassigned'
-                        days = b.days_overdue() or 0
-                        if not county:
-                            rows.append(f"| {ref} | {c_name} | {ward} | {owner} | {b.payment_year} | KES {b.amount:,.2f} | {days} days |")
-                        else:
-                            rows.append(f"| {ref} | {ward} | {owner} | {b.payment_year} | KES {b.amount:,.2f} | {days} days |")
-
-                    headers = "| Parcel Ref | County | Ward | Owner | Year | Amount | Overdue |\n| --- | --- | --- | --- | --- | --- | --- |" if not county else "| Parcel Ref | Ward | Owner | Year | Amount | Overdue |\n| --- | --- | --- | --- | --- | --- |"
-                    table = "\n".join(rows)
-                    answer = (
-                        f"### Unpaid Land Parcels{scope_label}\n\n"
-                        f"{headers}\n"
-                        f"{table}\n\n"
-                        f"*Showing top {len(rows)} overdue parcel bills.*"
-                    )
-                else:
-                    answer = (
-                        f"### Unpaid Land Parcels{scope_label}\n\n"
-                        f"There are currently **0 unpaid or overdue parcel bills** recorded in the database{scope_label}.\n\n"
-                        f"- All registered parcels are either compliant, fully paid, or pending new billing cycles."
-                    )
-
-                return Response({
-                    "answer": answer,
-                    "sources": [{"tool": "defaulters", "args": {"county": county or "all", "year": year}}],
-                    "used_fallback": False,
-                })
-            except Exception:
-                pass
-
-        # 6. Standard County Reconciliation Overview via IBM Granite SLM or Deterministic Engine
-        target_county = county or user_county or ('Nyeri' if not is_superadmin else None)
-        if target_county:
-            try:
-                parcels_qs = Parcel.objects.filter(county_q('county', target_county), is_deleted=False)
-                parcel_stats = parcels_qs.aggregate(
-                    total_parcels=Count('parcel_id'),
-                    total_area_m2=Sum('area_m2'),
-                )
-                total_parcels = parcel_stats['total_parcels'] or 0
-                total_area_m2 = parcel_stats['total_area_m2'] or 0.0
-
-                bills_qs = Payment.objects.filter(
-                    county_q('parcel__county', target_county),
-                    payment_year=year,
-                    is_deleted=False,
-                ).exclude(status='refunded')
-
-                bill_stats = bills_qs.aggregate(
-                    total_billed=Sum('amount'),
-                    total_collected=Sum('amount', filter=Q(status='completed')),
-                    compliant_count=Count('payment_id', filter=Q(status='completed')),
-                    defaulter_count=Count('payment_id', filter=Q(status__in=['pending', 'processing', 'failed'], deadline__lt=now)),
-                )
-
-                total_collected = float(bill_stats['total_collected'] or Decimal('0'))
-                total_billed = float(bill_stats['total_billed'] or Decimal('0'))
-                compliant = bill_stats['compliant_count'] or 0
-                defaulters = bill_stats['defaulter_count'] or 0
-                outstanding = max(0.0, total_billed - total_collected)
-
-                metrics = {
-                    "county": target_county,
-                    "year": year,
-                    "total_parcels": total_parcels,
-                    "total_area_sq_km": round(total_area_m2 / 1_000_000, 2),
-                    "compliant": compliant,
-                    "defaulters": defaulters,
-                    "total_billed_kes": total_billed,
-                    "total_collected_kes": total_collected,
-                    "outstanding_kes": outstanding,
-                }
-
-                report = None
-                if format_markdown:
-                    try:
-                        report = format_markdown(county=target_county, data=metrics)
-                    except Exception:
-                        report = None
-
-                if not report:
-                    comp_rate = round(compliant / max(1, compliant + defaulters) * 100, 1)
-                    coll_rate = round(total_collected / max(1.0, total_billed) * 100, 1)
-                    report = (
-                        f"### {target_county} County — Land Rates Reconciliation ({year})\n\n"
-                        f"| Metric | {target_county} County ({year}) |\n"
-                        f"| :--- | :--- |\n"
-                        f"| **Total Registered Parcels** | {total_parcels:,} |\n"
-                        f"| **Total Cadastral Area** | {round(total_area_m2 / 1_000_000, 2):,.2f} sq km |\n"
-                        f"| **Compliant Parcels** | {compliant:,} |\n"
-                        f"| **Delinquent Defaulters** | {defaulters:,} |\n"
-                        f"| **Total Billed Revenue** | KES {total_billed:,.2f} |\n"
-                        f"| **Total Collected Revenue** | KES {total_collected:,.2f} |\n"
-                        f"| **Outstanding Arrears** | KES {outstanding:,.2f} |\n\n"
-                        f"- **Compliance Rate:** {comp_rate}%\n"
-                        f"- **Collection Rate:** {coll_rate}%\n"
-                        f"- Records verified against county land registry and rates billing ledger."
-                    )
-
-                return Response({
-                    "answer": report,
-                    "sources": [
-                        {"tool": "parcels", "args": {"county": target_county}},
-                        {"tool": "collections", "args": {"county": target_county, "year": year}},
-                    ],
-                    "used_fallback": False,
-                })
-            except Exception:
-                pass
-        elif is_superadmin and not target_county:
-            from . import rate_reports
-            c_rows = rate_reports.counties(year)
-            if c_rows:
-                lines = [
-                    "| County | Plots | Land Owners | Officials | Billed (KES) | Collected (KES) | Outstanding (KES) |",
-                    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-                ]
-                for cr in c_rows:
-                    lines.append(f"| **{cr['county']}** | {cr['parcels']} | {cr['ratepayers']} | {cr['officials']} | KES {cr['billed']:,.2f} | KES {cr['collected']:,.2f} | KES {cr['outstanding']:,.2f} |")
-                c_table = "\n".join(lines)
-                answer = (
-                    f"### National County Land Rates Overview ({year})\n\n"
-                    f"{c_table}\n\n"
-                    f"- Platform Superadmin Overview across all registered counties."
-                )
-                return Response({
-                    "answer": answer,
-                    "sources": [{"tool": "counties", "args": {"year": year}}],
-                    "used_fallback": False,
-                })
-
-        # 5. Fallback to assistant tool agent
-        from . import assistant
-        if not settings.LLM_API_URL:
-            return Response({"error": "LLM_API_URL is not configured on the server"},
-                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        try:
-            return Response(assistant.answer(
-                query,
-                history=serializer.validated_data.get('history'),
-                user=request.user,
-            ))
-        except assistant.AssistantError as exc:
-            return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return _ndjson(assistant.stream(
+            query,
+            history=serializer.validated_data.get('history'),
+            county=county,
+            user=request.user,
+        ))
 
 
 class ParcelDeletionRequestViewSet(mixins.ListModelMixin,
@@ -3182,84 +2868,3 @@ class ParcelDeletionRequestViewSet(mixins.ListModelMixin,
     @action(detail=True, methods=['post'], permission_classes=[IsPlatformOwner])
     def reject(self, request, pk=None):
         return self._decide(request, approve=False)
-
-
-try:
-    from .slm_client import extract_intent, format_markdown
-except ImportError:
-    try:
-        from slm_client import extract_intent, format_markdown
-    except ImportError:
-        extract_intent = None
-        format_markdown = None
-
-
-class AIReconciliationView(APIView):
-    permission_classes = [IsAdminOrAuditor]
-
-    def post(self, request):
-        prompt = request.data.get("prompt")
-        if not prompt:
-            return Response({"error": "Prompt is required"}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not extract_intent or not format_markdown:
-            return Response({"error": "SLM client not configured or missing"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        try:
-            intent_data = extract_intent(prompt)
-            county = intent_data.get("arguments", {}).get("county", "Nyeri")
-        except Exception as e:
-            return Response({"error": f"Inference error: {str(e)}"}, status=status.HTTP_502_BAD_GATEWAY)
-
-        year = timezone.now().year
-        now = timezone.now()
-
-        parcels_qs = Parcel.objects.filter(county_q('county', county), is_deleted=False)
-        parcel_stats = parcels_qs.aggregate(
-            total_parcels=Count('parcel_id'),
-            total_area_m2=Sum('area_m2'),
-        )
-        total_parcels = parcel_stats['total_parcels'] or 0
-        total_area_m2 = parcel_stats['total_area_m2'] or 0.0
-
-        bills_qs = Payment.objects.filter(
-            county_q('parcel__county', county),
-            payment_year=year,
-            is_deleted=False,
-        ).exclude(status='refunded')
-
-        bill_stats = bills_qs.aggregate(
-            total_billed=Sum('amount'),
-            total_collected=Sum('amount', filter=Q(status='completed')),
-            compliant_count=Count('payment_id', filter=Q(status='completed')),
-            defaulter_count=Count('payment_id', filter=Q(status__in=['pending', 'processing', 'failed'], deadline__lt=now)),
-        )
-
-        total_collected = float(bill_stats['total_collected'] or Decimal('0'))
-        total_billed = float(bill_stats['total_billed'] or Decimal('0'))
-        compliant = bill_stats['compliant_count'] or 0
-        defaulters = bill_stats['defaulter_count'] or 0
-        outstanding = max(0.0, total_billed - total_collected)
-
-        metrics = {
-            "county": county,
-            "year": year,
-            "total_parcels": total_parcels,
-            "total_area_sq_km": round(total_area_m2 / 1_000_000, 2),
-            "compliant": compliant,
-            "defaulters": defaulters,
-            "total_billed_kes": total_billed,
-            "total_collected_kes": total_collected,
-            "outstanding_kes": outstanding,
-        }
-
-        try:
-            markdown_report = format_markdown(county=county, data=metrics)
-        except Exception as e:
-            return Response({"error": f"Formatting error: {str(e)}"}, status=status.HTTP_502_BAD_GATEWAY)
-
-        return Response({
-            "county": county,
-            "metrics": metrics,
-            "report": markdown_report,
-        })

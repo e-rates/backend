@@ -9,15 +9,25 @@ from django.db.models import Q
 from django.utils import timezone
 
 from . import rate_reports, report_builders
-from .audit import mask
-from .models import Parcel, User
+from .models import User
+from .rate_reports import county_q
 
 MAX_ROWS = 40
-MAX_CONTEXT_CHARS = 14_000
-LLM_READ_TIMEOUT = 200  # a cold Ollama model load on Colab takes ~100s; warm calls are ~2s
-MAX_HISTORY_TURNS = 6
-MAX_HISTORY_CHARS = 2_000
-ANSWER_KEYS = ('response', 'answer', 'result', 'text', 'generated_text', 'output')
+MAX_TABLE_ROWS = 15
+LLM_READ_TIMEOUT = 60
+LLM_MAX_TOKENS = 120
+MAX_HISTORY_CHARS = 300
+PDF_TOOLS = ('generate_analysis_pdf', 'generate_report_pdf')
+
+SYSTEM_PROMPT = (
+    'You are the E-Rates assistant, a land rates and revenue helper for Kenyan county officials. '
+    'You can summarise collections, list defaulters and overdue plots, look up a plot or an owner, '
+    'show payments received, compare rating years, and generate official PDF reports. '
+    'The official has already been shown a table with the exact figures. '
+    'Reply in 1-3 short plain sentences pointing out what stands out, using the percentages and counts in FACTS. '
+    'Never repeat or calculate KES amounts, never invent figures, years or comparisons, and never draw tables. '
+    'If there are no FACTS, answer briefly and say what you can help with.'
+)
 
 
 class AssistantError(Exception):
@@ -42,85 +52,148 @@ def _date(value, default):
         return default
 
 
+def _kes(value):
+    return f'KES {Decimal(str(value or 0)):,.2f}'
+
+
+def _pct(part, whole):
+    return round(float(part) / float(whole) * 100, 1) if whole else 0.0
+
+
+def _scope(county):
+    return f' — {re.sub(r"\s+county$", "", county, flags=re.I)} County' if county else ' — all counties'
+
+
+def _table(headers, rows):
+    lines = ['| ' + ' | '.join(headers) + ' |', '|' + ' --- |' * len(headers)]
+    lines += ['| ' + ' | '.join(str(cell) for cell in row) + ' |' for row in rows[:MAX_TABLE_ROWS]]
+    more = len(rows) - MAX_TABLE_ROWS
+    return '\n'.join(lines) + (f'\n\n*…and {more} more.*' if more > 0 else '')
+
+
+def _result(markdown, facts=None):
+    return {'markdown': markdown, 'facts': facts or {}}
+
+
 def _bill_row(bill):
-    return {
-        'year': bill.payment_year,
-        'amount_kes': bill.amount,
-        'status': rate_reports.bill_state(bill),
-        'deadline': bill.deadline.astimezone(report_builders.NAIROBI).date() if bill.deadline else None,
-        'receipt': bill.processor_ref if bill.status == 'completed' and bill.processor_ref and not bill.processor_ref.startswith('ws_CO_') else None,
-    }
+    receipt = bill.processor_ref if bill.status == 'completed' and bill.processor_ref and not bill.processor_ref.startswith('ws_CO_') else None
+    deadline = bill.deadline.astimezone(report_builders.NAIROBI).date() if bill.deadline else None
+    return (bill.payment_year, _kes(bill.amount), rate_reports.bill_state(bill).replace('_', ' '), deadline or '—', receipt or '—')
 
 
-def tool_collections_summary(args):
+def tool_collections_summary(args, county, user):
     year = _year(args)
-    totals = rate_reports.collections(year)
-    wards = rate_reports.wards(year)
-    billed = sum((Decimal(w['outstanding']) + Decimal(w['collected']) for w in wards), Decimal(0))
-    return {
+    totals = rate_reports.collections(year, county=county)
+    wards = rate_reports.wards(year, county=county)
+    billed = sum((w['outstanding'] + w['collected'] for w in wards), Decimal(0))
+    rate = _pct(totals['collected_for_year'], billed)
+    rows = [
+        (w['ward'].title(), w['sub_county'], w['billed'], w['paid'], w['overdue'], _kes(w['collected']), _kes(w['outstanding']))
+        for w in wards
+    ]
+    markdown = (
+        f'### Collections {year}{_scope(county)}\n\n'
+        f'- **Collected for {year}:** {_kes(totals["collected_for_year"])}\n'
+        f'- **Billed for {year}:** {_kes(billed)}\n'
+        f'- **Collected today:** {_kes(totals["collected_today"])}\n'
+        f'- **Collection rate:** {rate}%\n\n'
+        + (_table(['Ward', 'Sub-county', 'Bills', 'Paid', 'Overdue', 'Collected', 'Outstanding'], rows) if rows else '*No billed plots yet.*')
+    )
+    bills = sum(w['billed'] for w in wards)
+    return _result(markdown, {
         'year': year,
-        'collected_for_year_kes': totals['collected_for_year'],
-        'collected_all_time_kes': totals['total_collected'],
-        'collected_today_kes': totals['collected_today'],
-        'billed_for_year_kes': billed,
-        'collection_rate_percent': round(Decimal(totals['collected_for_year']) / billed * 100, 1) if billed else 0,
-        'wards': [{k: w[k] for k in ('ward', 'sub_county', 'billed', 'paid', 'unpaid', 'overdue', 'collected', 'outstanding')} for w in wards],
-    }
+        'collection_rate_percent': rate,
+        'wards': len(wards),
+        'bills': bills,
+        'paid_percent': _pct(sum(w['paid'] for w in wards), bills),
+        'overdue_bills': sum(w['overdue'] for w in wards),
+        'ward_with_most_overdue': wards[0]['ward'] if wards and wards[0]['overdue'] else None,
+    })
 
 
-def tool_ward_summary(args):
+def tool_ward_summary(args, county, user):
     year = _year(args)
-    return {'year': year, 'wards': rate_reports.wards(year)}
+    wards = rate_reports.wards(year, county=county)
+    rows = [(w['ward'].title(), w['sub_county'], w['parcels'], w['paid'], w['unpaid'], w['overdue'], _kes(w['outstanding'])) for w in wards]
+    markdown = f'### Wards {year}{_scope(county)}\n\n' + (
+        _table(['Ward', 'Sub-county', 'Plots', 'Paid', 'Unpaid', 'Overdue', 'Outstanding'], rows) if rows else '*No wards with allocated plots.*'
+    )
+    return _result(markdown, {
+        'year': year,
+        'wards': len(wards),
+        'overdue_bills': sum(w['overdue'] for w in wards),
+        'ward_with_most_overdue': wards[0]['ward'] if wards and wards[0]['overdue'] else None,
+    })
 
 
-def tool_ward_parcels(args):
+def tool_ward_parcels(args, county, user):
     ward = str(args.get('ward') or '').strip()
     if not ward:
-        return {'error': 'ward is required'}
+        return _result('Name a ward to list its plots.')
     year = _year(args)
-    rows = rate_reports.ward_parcels(ward, year)
-    for row in rows:
-        row['owner_phone'] = mask(row['owner_phone'] or '') if row.get('owner_phone') else None
-        row.pop('owner_email', None)
-        row.pop('parcel_id', None)
-    return {'ward': ward, 'year': year, 'total_plots': len(rows), 'plots': rows[:MAX_ROWS], 'truncated': len(rows) > MAX_ROWS}
+    plots = rate_reports.ward_parcels(ward, year, county=county)
+    if not plots:
+        return _result(f'No allocated plots found in {ward.title()} ward{_scope(county)}.')
+    rows = [
+        (p['parcel_ref'], p['owner'], p['status'].replace('_', ' '), _kes(p['amount']) if p['amount'] else '—', p['days_overdue'] or '—')
+        for p in plots
+    ]
+    paid = sum(1 for p in plots if p['status'] == 'paid')
+    return _result(
+        f'### {ward.title()} ward plots {year}{_scope(county)}\n\n' + _table(['Plot', 'Owner', 'Status', 'Bill', 'Days overdue'], rows),
+        {'ward': ward, 'year': year, 'plots': len(plots), 'paid_percent': _pct(paid, len(plots)),
+         'overdue_plots': sum(1 for p in plots if p['status'] == 'overdue')},
+    )
 
 
-def tool_defaulters(args):
+def tool_defaulters(args, county, user):
     as_of = _date(args.get('as_of'), _today())
-    report = report_builders.arrears_report(as_of)
     ward = str(args.get('ward') or '').strip().lower()
-    rows = [r for r in report.sections[2].rows if not ward or r['ward'].lower() == ward]
-    return {
-        'as_of': as_of,
-        'ward_filter': ward or None,
-        'summary': {label: value for label, value, _ in report.summary},
-        'by_age': report.sections[0].rows,
-        'by_ward': report.sections[1].rows,
-        'defaulters': [
-            {k: r[k] for k in ('ward', 'plot', 'title_ref', 'owner', 'year', 'amount', 'deadline', 'days', 'bucket')}
-            for r in rows[:MAX_ROWS]
-        ],
-        'truncated': len(rows) > MAX_ROWS,
-    }
+    report = report_builders.arrears_report(as_of, county=county)
+    overdue = [r for r in report.sections[2].rows if not ward or r['ward'].lower() == ward]
+    heading = f'### Defaulters as of {as_of}{_scope(county)}' + (f', {ward.title()} ward' if ward else '')
+    if not overdue:
+        return _result(f'{heading}\n\nNo overdue bills.', {'overdue_bills': 0})
+    rows = [(r['plot'], r['ward'].title(), r['owner'], r['year'], _kes(r['amount']), r['days']) for r in overdue]
+    markdown = (
+        f'{heading}\n\n'
+        f'- **Overdue bills:** {len(overdue)}\n'
+        f'- **Defaulters:** {len({r["owner"] for r in overdue})}\n'
+        f'- **Total arrears:** {_kes(sum(r["amount"] for r in overdue))}\n\n'
+        + _table(['Plot', 'Ward', 'Owner', 'Year', 'Amount', 'Days overdue'], rows)
+    )
+    return _result(markdown, {
+        'overdue_bills': len(overdue),
+        'defaulters': len({r['owner'] for r in overdue}),
+        'oldest_days_overdue': max(r['days'] for r in overdue),
+        'bills_over_90_days': sum(1 for r in overdue if r['days'] > 90),
+    })
 
 
-def tool_plot_lookup(args):
+def tool_plot_lookup(args, county, user):
+    from .models import Parcel
     ref = str(args.get('plot') or '').strip()
-    parcel = Parcel.objects.filter(is_deleted=False).filter(
+    parcel = Parcel.objects.filter(county_q('county', county), is_deleted=False).filter(
         Q(parcel_ref__iexact=ref) | Q(parcel_ref__iexact=ref.split('/')[-1])
     ).select_related('owner_user').first()
     if not parcel:
-        return {'error': f'No plot {ref!r} found'}
+        return _result(f'No plot {ref!r} found{_scope(county) if county else ""}.')
     props = parcel.props or {}
-    return {
-        'plot': parcel.parcel_ref,
-        'title_ref': f"{props['REG_SECTIO']}/{parcel.parcel_ref}" if props.get('REG_SECTIO') else None,
-        'county': parcel.county, 'sub_county': parcel.sub_county, 'ward': parcel.ward,
-        'area_m2': round(parcel.area_m2 or 0), 'land_use': parcel.land_use, 'status': parcel.status,
-        'owner': parcel.owner_user.username if parcel.owner_user else None,
-        'bills': [_bill_row(b) for b in parcel.payments.filter(is_deleted=False).order_by('-payment_year')],
-    }
+    bills = list(parcel.payments.filter(is_deleted=False).order_by('-payment_year'))
+    markdown = (
+        f'### Plot {parcel.parcel_ref}\n\n'
+        + (f'- **Title ref:** {props["REG_SECTIO"]}/{parcel.parcel_ref}\n' if props.get('REG_SECTIO') else '')
+        + f'- **Location:** {(parcel.ward or "Unassigned").title()} ward, {parcel.sub_county}, {parcel.county}\n'
+        f'- **Area:** {round(parcel.area_m2 or 0):,} m²\n'
+        f'- **Land use:** {parcel.land_use or "—"}\n'
+        f'- **Owner:** {parcel.owner_user.username if parcel.owner_user else "Unallocated"}\n\n'
+        + (_table(['Year', 'Amount', 'Status', 'Deadline', 'Receipt'], [_bill_row(b) for b in bills]) if bills else '*No bills yet.*')
+    )
+    return _result(markdown, {
+        'bills': len(bills),
+        'unpaid_bills': sum(1 for b in bills if rate_reports.bill_state(b) in ('unpaid', 'overdue')),
+        'allocated': bool(parcel.owner_user),
+    })
 
 
 def _find_owner(name: str):
@@ -145,7 +218,6 @@ def _find_owner(name: str):
         matches = people.filter(username__icontains=parts[0]).filter(username__icontains=parts[-1])
         if matches.count() == 1:
             return matches.first()
-    # The model often drops the spaces ("JohnDoe"), so compare with separators stripped.
     target = re.sub(r'[^a-z0-9]', '', name.lower())
     if len(target) >= 3:
         for candidate in people.filter(username__icontains=target[:3])[:200]:
@@ -154,183 +226,104 @@ def _find_owner(name: str):
     return None
 
 
-def tool_owner_lookup(args):
+def tool_owner_lookup(args, county, user):
     name = str(args.get('owner') or '').strip()
-    user = _find_owner(name)
-    if not user:
-        return {'error': f'No owner {name!r} found'}
-    parcels = user.parcels.filter(is_deleted=False)
-    return {
-        'owner': user.username,
-        'phone': mask(user.phone) if user.phone else None,
-        'plots': [
-            {'plot': p.parcel_ref, 'ward': p.ward, 'bills': [_bill_row(b) for b in p.payments.filter(is_deleted=False).order_by('-payment_year')]}
-            for p in parcels[:MAX_ROWS]
-        ],
-    }
+    owner = _find_owner(name)
+    plots = list(owner.parcels.filter(county_q('county', county), is_deleted=False)[:MAX_ROWS]) if owner else []
+    if not plots:
+        return _result(f'No owner {name!r} with plots found{_scope(county) if county else ""}.')
+    rows = []
+    for plot in plots:
+        rows += [(plot.parcel_ref, (plot.ward or 'Unassigned').title(), *_bill_row(b)[:3]) for b in plot.payments.filter(is_deleted=False).order_by('-payment_year')]
+    return _result(
+        f'### Plots owned by {owner.username}\n\n' + (_table(['Plot', 'Ward', 'Year', 'Amount', 'Status'], rows) if rows else '*No bills yet.*'),
+        {'plots': len(plots), 'bills': len(rows), 'overdue_bills': sum(1 for r in rows if r[4] == 'overdue')},
+    )
 
 
-def tool_payments_in_period(args):
+def tool_payments_in_period(args, county, user):
     today = _today()
     start = _date(args.get('from'), today.replace(day=1))
     end = _date(args.get('to'), today)
-    report = report_builders.register_report(min(start, end), max(start, end))
-    rows = report.sections[0].rows
-    return {
-        'from': start, 'to': end,
-        'summary': {label: value for label, value, _ in report.summary},
-        'payments': [{k: r[k] for k in ('paid_at', 'receipt', 'plot', 'ward', 'payer', 'year', 'amount')} for r in rows[:MAX_ROWS]],
-        'truncated': len(rows) > MAX_ROWS,
-    }
-
-
-def tool_years_summary(args):
-    county = args.get('county') if args and args.get('county') != 'all' else None
-    rows = rate_reports.years(county=county)
-    unpaid = [r['year'] for r in rows if r['unpaid_bills']]
-    return {
-        'years': rows,
-        'years_with_unpaid_bills': unpaid,
-        'fully_paid_years': [r['year'] for r in rows if not r['unpaid_bills']],
-        'note': 'Every rating year that has bills. Use this for questions spanning more than one year.',
-    }
-
-
-def tool_generate_analysis_pdf(args, user=None):
-    from . import ai_reports
-    year = _year(args)
-    ward = str(args.get('ward') or '').strip() or None
-    user_county = getattr(user, 'county', None) if user else None
-    is_superadmin = bool(user and (user.is_superuser or getattr(user, 'role', None) == 'owner'))
-    if not is_superadmin and user_county:
-        county = user_county
-    else:
-        county = args.get('county') or user_county
-    generated_by = getattr(user, 'username', 'AI Assistant') if user else 'AI Assistant'
-    return ai_reports.build_executive_analysis_pdf(year=year, ward=ward, county=county, generated_by=generated_by)
-
-
-def tool_generate_report_pdf(args, user=None):
-    from . import ai_reports
-    report_type = str(args.get('report_type') or 'collections').strip()
-    year = _year(args)
-    ward = str(args.get('ward') or '').strip() or None
-    as_of = args.get('as_of')
-    from_date = args.get('from') or args.get('from_date')
-    to_date = args.get('to') or args.get('to_date')
-    user_county = getattr(user, 'county', None) if user else None
-    is_superadmin = bool(user and (user.is_superuser or getattr(user, 'role', None) == 'owner'))
-    if not is_superadmin and user_county:
-        county = user_county
-    else:
-        county = args.get('county') or user_county
-    generated_by = getattr(user, 'username', 'AI Assistant') if user else 'AI Assistant'
-    return ai_reports.build_standard_report_pdf(
-        report_type=report_type, year=year, ward=ward, as_of=as_of,
-        from_date=from_date, to_date=to_date, county=county, generated_by=generated_by
+    start, end = min(start, end), max(start, end)
+    report = report_builders.register_report(start, end, county=county)
+    payments = report.sections[0].rows
+    heading = f'### Payments received {start} to {end}{_scope(county)}'
+    if not payments:
+        return _result(f'{heading}\n\nNo confirmed payments in this period.', {'payments': 0})
+    rows = [(p['paid_at'], p['receipt'], p['plot'] or '—', p['payer'], _kes(p['amount'])) for p in payments]
+    without_receipt = sum(1 for p in payments if p['receipt'] == 'Pending reconciliation')
+    markdown = (
+        f'{heading}\n\n'
+        f'- **Payments:** {len(payments)}\n'
+        f'- **Total received:** {_kes(sum(p["amount"] for p in payments))}\n\n'
+        + _table(['Paid at', 'Receipt', 'Plot', 'Payer', 'Amount'], rows)
     )
+    return _result(markdown, {'payments': len(payments), 'without_mpesa_receipt': without_receipt})
+
+
+def tool_years_summary(args, county, user):
+    years = rate_reports.years(county=county)
+    if not years:
+        return _result(f'### Rating years{_scope(county)}\n\nNo bills have been issued yet.')
+    rows = [
+        (y['year'], y['bills'], y['paid_bills'], y['unpaid_bills'], _kes(y['billed']), _kes(y['collected']), _kes(y['outstanding']))
+        for y in reversed(years)
+    ]
+    return _result(
+        f'### Rating years{_scope(county)}\n\n' + _table(['Year', 'Bills', 'Paid', 'Unpaid', 'Billed', 'Collected', 'Outstanding'], rows),
+        {
+            'years_with_unpaid_bills': [y['year'] for y in years if y['unpaid_bills']],
+            'collection_rate_percent_by_year': {y['year']: _pct(y['collected'], y['billed']) for y in years},
+        },
+    )
+
+
+def _pdf_result(result):
+    if not result.get('download_url'):
+        return _result(result.get('error') or 'The report could not be generated.')
+    return _result(f'### {result["title"]}\n\n[{result["title"]}]({result["download_url"]})')
+
+
+def tool_generate_analysis_pdf(args, county, user):
+    from . import ai_reports
+    return _pdf_result(ai_reports.build_executive_analysis_pdf(
+        year=_year(args), ward=str(args.get('ward') or '').strip() or None, county=county,
+        generated_by=getattr(user, 'username', 'AI Assistant'),
+    ))
+
+
+def tool_generate_report_pdf(args, county, user):
+    from . import ai_reports
+    return _pdf_result(ai_reports.build_standard_report_pdf(
+        report_type=str(args.get('report_type') or 'collections').strip(), year=_year(args),
+        ward=str(args.get('ward') or '').strip() or None, as_of=args.get('as_of'),
+        from_date=args.get('from'), to_date=args.get('to'), county=county,
+        generated_by=getattr(user, 'username', 'AI Assistant'),
+    ))
 
 
 TOOLS = {
-    'generate_analysis_pdf': (tool_generate_analysis_pdf, 'Generate and export an executive AI analysis PDF report with KPI scorecards, ward compliance matrix, arrears risk aging, and recommendations. args: year, ward'),
-    'generate_report_pdf': (tool_generate_report_pdf, 'Generate and export an official PDF report for statutory compliance. args: report_type (collections, arrears, or register), year, ward, as_of, from, to'),
-    'years_summary': (tool_years_summary, 'Every rating year with bills: billed, collected, outstanding and which years still have unpaid bills. No args. Use for "which years", "all years", or any question not about a single year'),
-    'collections_summary': (tool_collections_summary, 'Money billed and collected for a rating year, overall and per ward. args: year'),
-    'ward_summary': (tool_ward_summary, 'Per ward: plots, paid, unpaid, overdue counts and amounts. args: year'),
-    'ward_parcels': (tool_ward_parcels, 'Every allocated plot in one ward with owner and bill status. args: ward (required), year'),
-    'defaulters': (tool_defaulters, 'Overdue unpaid bills with aging buckets, optionally for one ward. args: as_of (YYYY-MM-DD), ward'),
-    'plot_lookup': (tool_plot_lookup, 'One plot: location, owner, every bill and receipt. args: plot (plot number or title ref)'),
-    'owner_lookup': (tool_owner_lookup, 'One owner by username: their plots and bills. args: owner'),
-    'payments_in_period': (tool_payments_in_period, 'Confirmed payments between two dates with receipts. args: from, to (YYYY-MM-DD)'),
+    'generate_analysis_pdf': tool_generate_analysis_pdf,
+    'generate_report_pdf': tool_generate_report_pdf,
+    'years_summary': tool_years_summary,
+    'collections_summary': tool_collections_summary,
+    'ward_summary': tool_ward_summary,
+    'ward_parcels': tool_ward_parcels,
+    'defaulters': tool_defaulters,
+    'plot_lookup': tool_plot_lookup,
+    'owner_lookup': tool_owner_lookup,
+    'payments_in_period': tool_payments_in_period,
 }
 
 
-def _call_llm(prompt: str) -> str:
-    url = settings.LLM_API_URL
-    if not url:
-        raise AssistantError('LLM_API_URL is not configured on the server')
-    url = url.rstrip('/')
-    openai_style = url.endswith('/v1')
-    if openai_style:
-        endpoint = f'{url}/chat/completions'
-        payload = {
-            'model': settings.LLM_MODEL,
-            'messages': [{'role': 'user', 'content': prompt}],
-            'stream': False,
-        }
-    else:
-        endpoint = f'{url}/analyze'
-        payload = {'text': prompt}
-    try:
-        resp = requests.post(endpoint, json=payload, timeout=(5, LLM_READ_TIMEOUT))
-    except requests.RequestException as exc:
-        raise AssistantError(f'Could not reach the language model: {exc}') from exc
-    if resp.status_code != 200:
-        if resp.status_code in (502, 503, 504, 521, 522, 523, 524, 530):
-            # Cloudflare/ngrok speak these when the notebook tunnel has dropped.
-            raise AssistantError(
-                'The assistant is unreachable — the model notebook or its tunnel is down '
-                f'(upstream {resp.status_code}).'
-            )
-        if resp.status_code in (401, 403):
-            raise AssistantError(f'The model server refused the request ({resp.status_code}).')
-        if resp.status_code == 404:
-            raise AssistantError(
-                f'Language model endpoint returned 404 Not Found at {endpoint}. Ensure the AI model server is running.'
-            )
-        raise AssistantError(f'Language model returned {resp.status_code}')
-    try:
-        body = resp.json()
-    except ValueError:
-        return resp.text.strip()
-    if isinstance(body, str):
-        return body.strip()
-    if openai_style:
-        try:
-            return body['choices'][0]['message']['content'].strip()
-        except (KeyError, IndexError, TypeError, AttributeError):
-            raise AssistantError('Language model reply had no text')
-    for key in ANSWER_KEYS:
-        if isinstance(body.get(key), str):
-            return body[key].strip()
-    raise AssistantError('Language model reply had no text')
-
-
-def _plan_prompt(question: str) -> str:
-    tools = '\n'.join(f'- {name}: {desc}' for name, (_, desc) in TOOLS.items())
-    return (
-        f'You route questions for the E-Rates land-rates system of {settings.COUNTY_NAME}. Today is {_today()}.\n'
-        f'Available read-only data tools:\n{tools}\n\n'
-        'Pick at most 3 tools needed to answer the question. Reply with JSON only, no prose, exactly like:\n'
-        '{"tools": [{"name": "ward_summary", "args": {"year": 2026}}]}\n\n'
-        f'Question: {question}'
-    )
-
-
-def parse_plan(text: str):
-    match = re.search(r'\{.*\}', text or '', re.S)
-    if not match:
-        return []
-    try:
-        plan = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return []
-    calls = []
-    for item in (plan.get('tools') or [])[:3] if isinstance(plan, dict) else []:
-        if isinstance(item, dict) and item.get('name') in TOOLS:
-            args = item.get('args') if isinstance(item.get('args'), dict) else {}
-            calls.append((item['name'], args))
-    return calls
-
-
-def fallback_plan(question: str):
+def route(question: str):
     q = question.lower()
     year = re.search(r'\b(20\d\d)\b', q)
     base = {'year': int(year.group(1))} if year else {}
     plot = re.search(r'\b(?:plot|parcel)\s+(?:no\.?\s*)?([\w/-]*\d[\w/-]*)', q)
     if plot:
         return [('plot_lookup', {'plot': plot.group(1)})]
-    # "which years", "every year", "all years" — anything spanning more than one year.
     if not year and re.search(r'\b(which|what|all|every|each|any)\s+year|\byears\b|year[- ]on[- ]year|per year', q):
         return [('years_summary', {})]
     owner = re.search(r'\b(?:owner|owned by|belongs? to|who is|about)\s+([a-z][\w.@-]*(?:\s+[a-z][\w.@-]*)?)', q)
@@ -339,7 +332,6 @@ def fallback_plan(question: str):
     ward = re.search(r'\b([a-z][a-z-]+)\s+ward\b|\bward\s+(?:of\s+)?([a-z][a-z-]+)', q)
     ward_name = next((g for g in (ward.groups() if ward else ()) if g and g not in ('each', 'every', 'which', 'the', 'per')), None)
 
-    # Route requests for PDF generation or executive analysis reports
     is_pdf = bool(re.search(r'\b(pdf|download|export|print|generate)\b', q))
     is_analysis = bool(re.search(r'\b(analysis|analytics|intelligence|executive|briefing|review)\b', q))
     if is_pdf and is_analysis:
@@ -351,79 +343,100 @@ def fallback_plan(question: str):
     if is_pdf and re.search(r'report|collections?|revenue', q):
         return [('generate_report_pdf', {'report_type': 'collections', **base})]
 
-    if re.search(r'defaulter|overdue|arrear|owe|late', q):
+    if re.search(r'defaulter|overdue|arrear|unpaid|owe|owing|late', q):
         return [('defaulters', {'ward': ward_name} if ward_name else {})]
     if ward_name:
         return [('ward_parcels', {**base, 'ward': ward_name})]
     if re.search(r'receipt|payments? (made|received)|paid (this|last|in)|register', q):
         return [('payments_in_period', {})]
-    return [('collections_summary', base)]
+    if re.search(r'\bwards\b', q) and not re.search(r'collect', q):
+        return [('ward_summary', base)]
+    if re.search(r'collect|revenue|billed|compliance|summary|overview|reconcil|how much|performance|outstanding', q):
+        return [('collections_summary', base)]
+    return []
 
 
-def _history_block(history) -> str:
-    """Recent turns, oldest first, trimmed to fit MAX_HISTORY_CHARS."""
-    if not history:
-        return ''
-    lines = []
-    for turn in history[-MAX_HISTORY_TURNS:]:
-        role = 'User' if turn.get('role') == 'user' else 'Assistant'
-        text = (turn.get('text') or '').strip()
-        if text:
-            lines.append(f'{role}: {text}')
-    if not lines:
-        return ''
-    block = '\n'.join(lines)
-    if len(block) > MAX_HISTORY_CHARS:
-        block = '…(earlier turns dropped)\n' + block[-MAX_HISTORY_CHARS:]
-    return f'EARLIER IN THIS CONVERSATION:\n{block}\n\n'
+def _history_messages(history):
+    turns = [t for t in (history or []) if (t.get('text') or '').strip()][-2:]
+    return [
+        {'role': 'user' if t.get('role') == 'user' else 'assistant', 'content': t['text'].strip()[-MAX_HISTORY_CHARS:]}
+        for t in turns
+    ]
 
 
-def answer(question: str, history=None, user=None) -> dict:
-    import inspect
+def _stream_llm(messages):
+    endpoint = settings.LLM_API_URL.rstrip('/') + '/chat/completions'
+    payload = {
+        'model': settings.LLM_MODEL, 'messages': messages, 'stream': True,
+        'max_tokens': LLM_MAX_TOKENS, 'temperature': 0.1,
+    }
+    try:
+        resp = requests.post(endpoint, json=payload, stream=True, timeout=(5, LLM_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        raise AssistantError('The assistant model is unreachable.') from exc
+    with resp:
+        if resp.status_code != 200:
+            raise AssistantError(f'The assistant model returned {resp.status_code}.')
+        try:
+            for raw in resp.iter_lines():
+                line = raw.decode('utf-8').strip()
+                if not line.startswith('data:'):
+                    continue
+                data = line[5:].strip()
+                if data == '[DONE]':
+                    break
+                try:
+                    delta = json.loads(data)['choices'][0]['delta'].get('content')
+                except (ValueError, KeyError, IndexError, TypeError):
+                    continue
+                if delta:
+                    yield delta
+        except requests.RequestException as exc:
+            raise AssistantError('The assistant model stopped responding.') from exc
 
-    question = question.strip()
-    if not question:
-        raise AssistantError('Ask a question')
-    # Planning stays stateless: feeding it history makes it re-pick stale tools.
-    calls = parse_plan(_call_llm(_plan_prompt(question)))
-    used_fallback = not calls
-    if used_fallback:
-        calls = fallback_plan(question)
 
+def stream(question: str, history=None, county=None, user=None):
+    """Yields {text, sources} for the data tables, then {text} model deltas, or {error}."""
+    calls = route(question)
     results = []
     for name, args in calls:
         try:
-            tool_fn = TOOLS[name][0]
-            sig = inspect.signature(tool_fn)
-            if 'user' in sig.parameters:
-                data = tool_fn(args, user=user)
-            else:
-                data = tool_fn(args)
-        except Exception as exc:
-            data = {'error': f'{name} failed: {exc}'}
-        results.append({'tool': name, 'args': args, 'data': data})
+            results.append((name, args, TOOLS[name](args, county, user)))
+        except Exception:
+            results.append((name, args, _result(f'Could not load {name.replace("_", " ")}.')))
+    if results:
+        yield {
+            'text': '\n\n'.join(r['markdown'] for _, _, r in results) + '\n\n',
+            'sources': [{'tool': name, 'args': args} for name, args, _ in results],
+        }
+    if calls and all(name in PDF_TOOLS for name, _ in calls):
+        return
+    if not settings.LLM_API_URL:
+        if not results:
+            yield {'error': 'The assistant model is not configured on the server.'}
+        return
 
-    context = json.dumps(results, default=str, separators=(',', ':'))
-    if len(context) > MAX_CONTEXT_CHARS:
-        context = context[:MAX_CONTEXT_CHARS] + '…(truncated)'
-    reply = _call_llm(
-        f'You are the E-Rates assistant for {settings.COUNTY_NAME}. Today is {_today()}.\n'
-        'EVERY number below is an exact figure in Kenyan shillings (KES). They are NOT in thousands, '
-        'millions or any other unit. Quote each amount exactly as it appears — do not rescale it, round it, '
-        'approximate it, or add a note about what unit it might be in. A total of 1.00 means one shilling. '
-        'Never state a total that is not present in the data.\n'
-        'When a PDF report or analysis has been generated in the data (status: "success"), highlight the key findings '
-        'and always include a clear markdown download link with the title and download_url from the data, '
-        'for example: [Download PDF: <title>](<download_url>).\n'
-        'Answer the question using ONLY the data below. Always reply in full sentences — never a single word. '
-        'If the data does not answer the question, say so in a sentence and name what you would need instead. '
-        'Be concise; use a short list or GitHub-flavoured markdown table when comparing several items. '
-        'Never invent plots, people or figures.\n\n'
-        f'{_history_block(history)}'
-        f'DATA: {context}\n\nQUESTION: {question}'
-    )
-    return {
-        'answer': reply,
-        'sources': [{'tool': r['tool'], 'args': r['args']} for r in results],
-        'used_fallback': used_fallback,
-    }
+    facts = {name: r['facts'] for name, _, r in results if r['facts']}
+    content = f'QUESTION: {question}'
+    if facts:
+        content = f'FACTS: {json.dumps(facts, default=str, separators=(",", ":"))}\n{content}'
+    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, *_history_messages(history), {'role': 'user', 'content': content}]
+    shown = json.dumps(facts, default=str) + ''.join(r['markdown'] for _, _, r in results).replace(',', '')
+    allowed = {float(n) for n in re.findall(r'\d+(?:\.\d+)?', shown)}
+    pending = ''
+    try:
+        for delta in _stream_llm(messages):
+            pending += delta
+            *sentences, pending = re.split(r'(?<=[.!?])\s+', pending)
+            for sentence in sentences:
+                if _grounded(sentence, allowed):
+                    yield {'text': sentence + ' '}
+        if pending.strip() and _grounded(pending, allowed):
+            yield {'text': pending}
+    except AssistantError as exc:
+        yield {'error': str(exc)}
+
+
+def _grounded(sentence, allowed):
+    """Small models misquote figures, so a sentence survives only if every number in it was shown to the official."""
+    return all(float(n.replace(',', '')) in allowed for n in re.findall(r'\d[\d,]*(?:\.\d+)?', sentence) if n.strip(','))
