@@ -32,6 +32,10 @@ class AssistantTests(APITestCase):
                 parcel_ref=ref, geom=Polygon.from_bbox((36.8 + i / 100, -1.3, 36.801 + i / 100, -1.299)),
                 county=county, sub_county='Tetu', ward='karura', owner_user=owner, props={'REG_SECTIO': 'AGUTHI-GAAKI'},
             )
+        Parcel.objects.create(
+            parcel_ref='555', geom=Polygon.from_bbox((36.9, -1.3, 36.901, -1.299)),
+            county='Nyeri County', sub_county='Tetu', ward='karura',
+        )
         generate_rate_bills(2026, timezone.now() + timedelta(days=30))
         Payment.objects.filter(parcel__parcel_ref__in=['317', '900']).update(deadline=timezone.now() - timedelta(days=10))
         self.client.force_authenticate(self.official)
@@ -47,11 +51,23 @@ class AssistantTests(APITestCase):
     def text(events):
         return ''.join(e.get('text', '') for e in events)
 
-    def test_who_are_you_goes_to_the_model_without_data(self):
-        events, llm = self.ask('who are you')
+    @staticmethod
+    def facts(llm):
+        return json.loads(llm.call_args.args[0][-1]['content'].split('FACTS: ')[1].split('\nQUESTION')[0])
+
+    def test_unmatched_questions_get_the_county_snapshot(self):
+        events, llm = self.ask('how many parcels are unassigned to owners')
         self.assertNotIn('sources', events[0])
         self.assertEqual(self.text(events), 'Model commentary.')
-        self.assertEqual(llm.call_args.args[0][-1]['content'], 'QUESTION: who are you')
+        snapshot = self.facts(llm)['snapshot']
+        self.assertEqual(snapshot['registered_parcels'], 3)
+        self.assertEqual(snapshot['parcels_without_owners'], 1)
+
+    def test_whatever_the_model_says_is_shown(self):
+        def free(messages):
+            yield 'There are 4 unassigned parcels worth KES 99,999.'
+        events, _ = self.ask('how many parcels are unassigned', model=free)
+        self.assertEqual(self.text(events), 'There are 4 unassigned parcels worth KES 99,999.')
 
     def test_table_arrives_before_the_commentary(self):
         events, _ = self.ask('Which defaulters are in karura ward?')
@@ -59,29 +75,17 @@ class AssistantTests(APITestCase):
         self.assertIn('| 317 |', events[0]['text'])
         self.assertTrue(self.text(events).endswith('Model commentary.'))
 
-    def test_sentences_with_invented_figures_are_dropped(self):
-        def invents(messages):
-            yield 'There is 1 overdue bill. It totals 99,999 '
-            yield 'in arrears. Arrears stand at KES 4,800.00. Another 42 plots are late.'
-        events, _ = self.ask('show defaulters', model=invents)
-        self.assertTrue(self.text(events).endswith('\n\nThere is 1 overdue bill. Arrears stand at KES 4,800.00. '))
-
-    def test_code_comments_when_every_model_sentence_is_dropped(self):
-        def invents_everything(messages):
-            yield 'Collections reached KES 270,395 across 42 plots.'
-        events, _ = self.ask('show defaulters', model=invents_everything)
-        self.assertTrue(self.text(events).endswith('\n\n1 overdue bill; the oldest has been unpaid for 10 days.'))
+    def test_model_sees_counts_not_people_or_phones(self):
+        events, llm = self.ask('List karura ward plots')
+        self.assertEqual(events[0]['sources'], [{'tool': 'ward_parcels', 'args': {'ward': 'karura'}}])
+        prompt = json.dumps(llm.call_args.args[0])
+        self.assertNotIn('0712345678', prompt)
+        self.assertNotIn('wanjiru', prompt)
 
     def test_a_bare_follow_up_reuses_the_previous_question(self):
         history = [{'role': 'user', 'text': 'do we have any data on Nyeri county'}, {'role': 'assistant', 'text': 'Which year?'}]
         events, _ = self.ask('2026', history=history)
         self.assertEqual(events[0]['sources'], [{'tool': 'collections_summary', 'args': {'year': 2026}}])
-
-    def test_never_silent_when_every_sentence_is_dropped(self):
-        def invents(messages):
-            yield 'There are 500 plots in 2026.'
-        events, _ = self.ask('who are you', model=invents)
-        self.assertEqual(self.text(events), assistant.HELP_TEXT)
 
     def test_superadmin_can_list_counties(self):
         self.client.force_authenticate(User.objects.create_superuser('root', 'root@example.com', 'Password123!'))
@@ -89,19 +93,11 @@ class AssistantTests(APITestCase):
         self.assertIn('| Kiambu |', events[0]['text'])
         self.assertIn('| Nyeri |', events[0]['text'])
 
-    def test_model_sees_counts_not_people_or_phones(self):
-        events, llm = self.ask('List karura ward plots')
-        self.assertEqual(events[0]['sources'], [{'tool': 'ward_parcels', 'args': {'ward': 'karura'}}])
-        prompt = json.dumps(llm.call_args.args[0])
-        self.assertIn('FACTS', prompt)
-        self.assertNotIn('0712345678', prompt)
-        self.assertNotIn('wanjiru', prompt)
-
     def test_multi_year_question_reaches_years_summary(self):
         events, llm = self.ask('Which years are unpaid for?')
         self.assertEqual(events[0]['sources'], [{'tool': 'years_summary', 'args': {}}])
         self.assertIn('| 2026 |', events[0]['text'])
-        self.assertIn('years_with_unpaid_bills', llm.call_args.args[0][-1]['content'])
+        self.assertEqual(self.facts(llm)['years_summary']['years_with_unpaid_bills'], [2026])
 
     def test_officials_cannot_ask_about_another_county(self):
         events, llm = self.ask('show kiambu defaulters')
@@ -109,9 +105,10 @@ class AssistantTests(APITestCase):
         llm.assert_not_called()
 
     def test_officials_only_see_their_own_county(self):
-        events, _ = self.ask('show defaulters')
+        events, llm = self.ask('show defaulters')
         self.assertIn('| 317 |', events[0]['text'])
         self.assertNotIn('| 900 |', events[0]['text'])
+        self.assertEqual(self.facts(llm)['snapshot']['registered_parcels'], 3)
         events, _ = self.ask('status of plot 900')
         self.assertIn('No plot', events[0]['text'])
 

@@ -9,30 +9,22 @@ from django.db.models import Q
 from django.utils import timezone
 
 from . import rate_reports, report_builders
-from .models import User
+from .models import Parcel, Payment, User
 from .rate_reports import county_q
 
 MAX_ROWS = 40
 MAX_TABLE_ROWS = 15
 LLM_READ_TIMEOUT = 60
-LLM_MAX_TOKENS = 120
+LLM_MAX_TOKENS = 160
 MAX_HISTORY_CHARS = 300
 PDF_TOOLS = ('generate_analysis_pdf', 'generate_report_pdf')
 
 SYSTEM_PROMPT = (
-    'You are the E-Rates assistant, a land rates and revenue helper for Kenyan county officials. '
+    'You are the E-Rates assistant, an AI for Kenyan county land rates and revenue officials. '
     'You can summarise collections, list defaulters and overdue plots, look up a plot or an owner, '
-    'show payments received, compare rating years, and generate official PDF reports. '
-    'The official has already been shown a table with the exact figures. '
-    'Reply in 1-3 short plain sentences pointing out what stands out, using the percentages and counts in FACTS. '
-    'Never repeat or calculate KES amounts, never invent figures, years or comparisons, and never draw tables. '
-    'If there are no FACTS, answer briefly and say what you can help with.'
-)
-
-
-HELP_TEXT = (
-    'I can show collections, defaulters, a plot or owner, payments received, rating years or counties, '
-    'and generate PDF reports. Try "collections for 2026" or "show defaulters".'
+    'show payments received, compare rating years and counties, and generate official PDF reports. '
+    'Answer the question directly and confidently in 1-3 short sentences, using the FACTS provided. '
+    'Any table has already been shown to the official, so do not redraw it.'
 )
 
 
@@ -87,6 +79,23 @@ def _bill_row(bill):
     return (bill.payment_year, _kes(bill.amount), rate_reports.bill_state(bill).replace('_', ' '), deadline or '—', receipt or '—')
 
 
+def snapshot(county):
+    parcels = Parcel.objects.filter(county_q('county', county), is_deleted=False)
+    total = parcels.count()
+    allocated = parcels.filter(owner_user__isnull=False).count()
+    bills = Payment.objects.filter(county_q('parcel__county', county), is_deleted=False).exclude(status='refunded')
+    return {
+        'county': county or 'all counties',
+        'today': str(_today()),
+        'registered_parcels': total,
+        'parcels_with_owners': allocated,
+        'parcels_without_owners': total - allocated,
+        'wards': parcels.exclude(ward__isnull=True).exclude(ward='').values('ward').distinct().count(),
+        'rate_bills': bills.count(),
+        'paid_bills': bills.filter(status='completed').count(),
+    }
+
+
 def tool_collections_summary(args, county, user):
     year = _year(args)
     totals = rate_reports.collections(year, county=county)
@@ -108,6 +117,8 @@ def tool_collections_summary(args, county, user):
     bills = sum(w['billed'] for w in wards)
     return _result(markdown, {
         'year': year,
+        'collected_for_year_kes': totals['collected_for_year'],
+        'billed_for_year_kes': billed,
         'collection_rate_percent': rate,
         'wards': len(wards),
         'bills': bills,
@@ -161,23 +172,24 @@ def tool_defaulters(args, county, user):
     if not overdue:
         return _result(f'{heading}\n\nNo overdue bills.', {'overdue_bills': 0})
     rows = [(r['plot'], r['ward'].title(), r['owner'], r['year'], _kes(r['amount']), r['days']) for r in overdue]
+    total = sum(r['amount'] for r in overdue)
     markdown = (
         f'{heading}\n\n'
         f'- **Overdue bills:** {len(overdue)}\n'
         f'- **Defaulters:** {len({r["owner"] for r in overdue})}\n'
-        f'- **Total arrears:** {_kes(sum(r["amount"] for r in overdue))}\n\n'
+        f'- **Total arrears:** {_kes(total)}\n\n'
         + _table(['Plot', 'Ward', 'Owner', 'Year', 'Amount', 'Days overdue'], rows)
     )
     return _result(markdown, {
         'overdue_bills': len(overdue),
         'defaulters': len({r['owner'] for r in overdue}),
+        'total_arrears_kes': total,
         'oldest_days_overdue': max(r['days'] for r in overdue),
         'bills_over_90_days': sum(1 for r in overdue if r['days'] > 90),
     })
 
 
 def tool_plot_lookup(args, county, user):
-    from .models import Parcel
     ref = str(args.get('plot') or '').strip()
     parcel = Parcel.objects.filter(county_q('county', county), is_deleted=False).filter(
         Q(parcel_ref__iexact=ref) | Q(parcel_ref__iexact=ref.split('/')[-1])
@@ -196,6 +208,9 @@ def tool_plot_lookup(args, county, user):
         + (_table(['Year', 'Amount', 'Status', 'Deadline', 'Receipt'], [_bill_row(b) for b in bills]) if bills else '*No bills yet.*')
     )
     return _result(markdown, {
+        'plot': parcel.parcel_ref,
+        'ward': parcel.ward,
+        'area_m2': round(parcel.area_m2 or 0),
         'bills': len(bills),
         'unpaid_bills': sum(1 for b in bills if rate_reports.bill_state(b) in ('unpaid', 'overdue')),
         'allocated': bool(parcel.owner_user),
@@ -258,14 +273,18 @@ def tool_payments_in_period(args, county, user):
     if not payments:
         return _result(f'{heading}\n\nNo confirmed payments in this period.', {'payments': 0})
     rows = [(p['paid_at'], p['receipt'], p['plot'] or '—', p['payer'], _kes(p['amount'])) for p in payments]
-    without_receipt = sum(1 for p in payments if p['receipt'] == 'Pending reconciliation')
+    total = sum(p['amount'] for p in payments)
     markdown = (
         f'{heading}\n\n'
         f'- **Payments:** {len(payments)}\n'
-        f'- **Total received:** {_kes(sum(p["amount"] for p in payments))}\n\n'
+        f'- **Total received:** {_kes(total)}\n\n'
         + _table(['Paid at', 'Receipt', 'Plot', 'Payer', 'Amount'], rows)
     )
-    return _result(markdown, {'payments': len(payments), 'without_mpesa_receipt': without_receipt})
+    return _result(markdown, {
+        'payments': len(payments),
+        'total_received_kes': total,
+        'without_mpesa_receipt': sum(1 for p in payments if p['receipt'] == 'Pending reconciliation'),
+    })
 
 
 def tool_years_summary(args, county, user):
@@ -282,6 +301,20 @@ def tool_years_summary(args, county, user):
             'years_with_unpaid_bills': [y['year'] for y in years if y['unpaid_bills']],
             'collection_rate_percent_by_year': {y['year']: _pct(y['collected'], y['billed']) for y in years},
         },
+    )
+
+
+def tool_counties(args, county, user):
+    if county:
+        return tool_collections_summary(args, county, user)
+    year = _year(args)
+    counties = rate_reports.counties(year)
+    if not counties:
+        return _result('No counties have data yet.')
+    rows = [(c['county'], c['parcels'], c['ratepayers'], _kes(c['billed']), _kes(c['collected']), _kes(c['outstanding'])) for c in counties]
+    return _result(
+        f'### Counties {year}\n\n' + _table(['County', 'Plots', 'Land owners', 'Billed', 'Collected', 'Outstanding'], rows),
+        {'year': year, 'counties': len(counties), 'collection_rate_percent_by_county': {c['county']: _pct(c['collected'], c['billed']) for c in counties}},
     )
 
 
@@ -320,25 +353,8 @@ TOOLS = {
     'plot_lookup': tool_plot_lookup,
     'owner_lookup': tool_owner_lookup,
     'payments_in_period': tool_payments_in_period,
-    'counties': None,
+    'counties': tool_counties,
 }
-
-
-def tool_counties(args, county, user):
-    if county:
-        return tool_collections_summary(args, county, user)
-    year = _year(args)
-    counties = rate_reports.counties(year)
-    if not counties:
-        return _result('No counties have data yet.')
-    rows = [(c['county'], c['parcels'], c['ratepayers'], _kes(c['billed']), _kes(c['collected']), _kes(c['outstanding'])) for c in counties]
-    return _result(
-        f'### Counties {year}\n\n' + _table(['County', 'Plots', 'Land owners', 'Billed', 'Collected', 'Outstanding'], rows),
-        {'year': year, 'counties': len(counties), 'collection_rate_percent_by_county': {c['county']: _pct(c['collected'], c['billed']) for c in counties}},
-    )
-
-
-TOOLS['counties'] = tool_counties
 
 
 def route(question: str):
@@ -377,7 +393,7 @@ def route(question: str):
         return [('ward_summary', base)]
     if re.search(r'\bcounties\b', q):
         return [('counties', base)]
-    if re.search(r'collect|revenue|billed|compliance|summary|overview|reconcil|how much|performance|outstanding|\bdata\b|statistic|figures|numbers|\bcounty\b', q):
+    if re.search(r'collect|revenue|billed|compliance|summary|overview|reconcil|how much|performance|outstanding|\bdata\b|statistic|figures|\bcounty\b', q):
         return [('collections_summary', base)]
     return []
 
@@ -394,7 +410,7 @@ def _stream_llm(messages):
     endpoint = settings.LLM_API_URL.rstrip('/') + '/chat/completions'
     payload = {
         'model': settings.LLM_MODEL, 'messages': messages, 'stream': True,
-        'max_tokens': LLM_MAX_TOKENS, 'temperature': 0.1,
+        'max_tokens': LLM_MAX_TOKENS, 'temperature': 0.3,
     }
     try:
         resp = requests.post(endpoint, json=payload, stream=True, timeout=(5, LLM_READ_TIMEOUT))
@@ -445,58 +461,11 @@ def stream(question: str, history=None, county=None, user=None):
             yield {'error': 'The assistant model is not configured on the server.'}
         return
 
-    facts = {name: r['facts'] for name, _, r in results if r['facts']}
-    content = f'QUESTION: {question}'
-    if facts:
-        content = (
-            f'FACTS: {json.dumps(facts, default=str, separators=(",", ":"))}\n'
-            'The official already sees every KES amount on screen. Comment only on the percentages, counts '
-            'and which ward stands out. Write no money amounts.\n'
-            f'{content}'
-        )
+    facts = {'snapshot': snapshot(county), **{name: r['facts'] for name, _, r in results if r['facts']}}
+    content = f'FACTS: {json.dumps(facts, default=str, separators=(",", ":"))}\nQUESTION: {question}'
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, *_history_messages(history), {'role': 'user', 'content': content}]
-    shown = json.dumps(facts, default=str) + ''.join(r['markdown'] for _, _, r in results).replace(',', '')
-    allowed = {float(n) for n in re.findall(r'\d+(?:\.\d+)?', shown)}
-    pending = ''
-    said = False
     try:
         for delta in _stream_llm(messages):
-            pending += delta
-            *sentences, pending = re.split(r'(?<=[.!?])\s+', pending)
-            for sentence in sentences:
-                if _grounded(sentence, allowed):
-                    said = True
-                    yield {'text': sentence + ' '}
-        if pending.strip() and _grounded(pending, allowed):
-            said = True
-            yield {'text': pending}
+            yield {'text': delta}
     except AssistantError as exc:
         yield {'error': str(exc)}
-        return
-    if not said:
-        yield {'text': _facts_comment(facts) or HELP_TEXT}
-
-
-def _facts_comment(facts):
-    merged = {k: v for tool_facts in facts.values() for k, v in tool_facts.items()}
-    parts = []
-    if isinstance(merged.get('collection_rate_percent'), (int, float)):
-        parts.append(f'collection rate is {merged["collection_rate_percent"]}%')
-    if merged.get('overdue_bills'):
-        n = merged['overdue_bills']
-        parts.append(f'{n} overdue bill{"s" if n != 1 else ""}')
-    if merged.get('ward_with_most_overdue'):
-        parts.append(f'{merged["ward_with_most_overdue"].title()} ward has the most overdue bills')
-    if merged.get('oldest_days_overdue'):
-        parts.append(f'the oldest has been unpaid for {merged["oldest_days_overdue"]} days')
-    if merged.get('years_with_unpaid_bills'):
-        parts.append('unpaid bills remain from ' + ', '.join(str(y) for y in merged['years_with_unpaid_bills']))
-    if not parts:
-        return ''
-    text = '; '.join(parts)
-    return text[0].upper() + text[1:] + '.'
-
-
-def _grounded(sentence, allowed):
-    """Small models misquote figures, so a sentence survives only if every number in it was shown to the official."""
-    return all(float(n.replace(',', '')) in allowed for n in re.findall(r'\d[\d,]*(?:\.\d+)?', sentence) if n.strip(','))
