@@ -12,6 +12,6 @@ class SignedDownloadTests(APITestCase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.content.startswith(b'%PDF'))
-        self.assertIn('attachment', resp['Content-Disposition'])
+        self.assertIn('inline', resp['Content-Disposition'])
         self.assertEqual(self.client.get(url.replace('sig=', 'sig=x')).status_code, 403)
         self.assertEqual(self.client.get('/api/reports/download/?report=collections&file_format=pdf').status_code, 403)
