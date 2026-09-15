@@ -30,6 +30,12 @@ SYSTEM_PROMPT = (
 )
 
 
+HELP_TEXT = (
+    'I can show collections, defaulters, a plot or owner, payments received, rating years or counties, '
+    'and generate PDF reports. Try "collections for 2026" or "show defaulters".'
+)
+
+
 class AssistantError(Exception):
     pass
 
@@ -314,7 +320,25 @@ TOOLS = {
     'plot_lookup': tool_plot_lookup,
     'owner_lookup': tool_owner_lookup,
     'payments_in_period': tool_payments_in_period,
+    'counties': None,
 }
+
+
+def tool_counties(args, county, user):
+    if county:
+        return tool_collections_summary(args, county, user)
+    year = _year(args)
+    counties = rate_reports.counties(year)
+    if not counties:
+        return _result('No counties have data yet.')
+    rows = [(c['county'], c['parcels'], c['ratepayers'], _kes(c['billed']), _kes(c['collected']), _kes(c['outstanding'])) for c in counties]
+    return _result(
+        f'### Counties {year}\n\n' + _table(['County', 'Plots', 'Land owners', 'Billed', 'Collected', 'Outstanding'], rows),
+        {'year': year, 'counties': len(counties), 'collection_rate_percent_by_county': {c['county']: _pct(c['collected'], c['billed']) for c in counties}},
+    )
+
+
+TOOLS['counties'] = tool_counties
 
 
 def route(question: str):
@@ -351,7 +375,9 @@ def route(question: str):
         return [('payments_in_period', {})]
     if re.search(r'\bwards\b', q) and not re.search(r'collect', q):
         return [('ward_summary', base)]
-    if re.search(r'collect|revenue|billed|compliance|summary|overview|reconcil|how much|performance|outstanding', q):
+    if re.search(r'\bcounties\b', q):
+        return [('counties', base)]
+    if re.search(r'collect|revenue|billed|compliance|summary|overview|reconcil|how much|performance|outstanding|\bdata\b|statistic|figures|numbers|\bcounty\b', q):
         return [('collections_summary', base)]
     return []
 
@@ -398,6 +424,9 @@ def _stream_llm(messages):
 def stream(question: str, history=None, county=None, user=None):
     """Yields {text, sources} for the data tables, then {text} model deltas, or {error}."""
     calls = route(question)
+    previous = next((t['text'] for t in reversed(history or []) if t.get('role') == 'user' and (t.get('text') or '').strip()), '')
+    if not calls and previous:
+        calls = route(f'{previous} {question}')
     results = []
     for name, args in calls:
         try:
@@ -444,10 +473,8 @@ def stream(question: str, history=None, county=None, user=None):
     except AssistantError as exc:
         yield {'error': str(exc)}
         return
-    if not said and facts:
-        comment = _facts_comment(facts)
-        if comment:
-            yield {'text': comment}
+    if not said:
+        yield {'text': _facts_comment(facts) or HELP_TEXT}
 
 
 def _facts_comment(facts):

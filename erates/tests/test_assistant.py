@@ -72,6 +72,23 @@ class AssistantTests(APITestCase):
         events, _ = self.ask('show defaulters', model=invents_everything)
         self.assertTrue(self.text(events).endswith('\n\n1 overdue bill; the oldest has been unpaid for 10 days.'))
 
+    def test_a_bare_follow_up_reuses_the_previous_question(self):
+        history = [{'role': 'user', 'text': 'do we have any data on Nyeri county'}, {'role': 'assistant', 'text': 'Which year?'}]
+        events, _ = self.ask('2026', history=history)
+        self.assertEqual(events[0]['sources'], [{'tool': 'collections_summary', 'args': {'year': 2026}}])
+
+    def test_never_silent_when_every_sentence_is_dropped(self):
+        def invents(messages):
+            yield 'There are 500 plots in 2026.'
+        events, _ = self.ask('who are you', model=invents)
+        self.assertEqual(self.text(events), assistant.HELP_TEXT)
+
+    def test_superadmin_can_list_counties(self):
+        self.client.force_authenticate(User.objects.create_superuser('root', 'root@example.com', 'Password123!'))
+        events, _ = self.ask('which counties do we have?')
+        self.assertIn('| Kiambu |', events[0]['text'])
+        self.assertIn('| Nyeri |', events[0]['text'])
+
     def test_model_sees_counts_not_people_or_phones(self):
         events, llm = self.ask('List karura ward plots')
         self.assertEqual(events[0]['sources'], [{'tool': 'ward_parcels', 'args': {'ward': 'karura'}}])
