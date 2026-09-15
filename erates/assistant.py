@@ -185,7 +185,8 @@ def tool_payments_in_period(args):
 
 
 def tool_years_summary(args):
-    rows = rate_reports.years()
+    county = args.get('county') if args and args.get('county') != 'all' else None
+    rows = rate_reports.years(county=county)
     unpaid = [r['year'] for r in rows if r['unpaid_bills']]
     return {
         'years': rows,
@@ -199,7 +200,12 @@ def tool_generate_analysis_pdf(args, user=None):
     from . import ai_reports
     year = _year(args)
     ward = str(args.get('ward') or '').strip() or None
-    county = getattr(user, 'county', None) if user else None
+    user_county = getattr(user, 'county', None) if user else None
+    is_superadmin = bool(user and (user.is_superuser or getattr(user, 'role', None) == 'owner'))
+    if not is_superadmin and user_county:
+        county = user_county
+    else:
+        county = args.get('county') or user_county
     generated_by = getattr(user, 'username', 'AI Assistant') if user else 'AI Assistant'
     return ai_reports.build_executive_analysis_pdf(year=year, ward=ward, county=county, generated_by=generated_by)
 
@@ -212,7 +218,12 @@ def tool_generate_report_pdf(args, user=None):
     as_of = args.get('as_of')
     from_date = args.get('from') or args.get('from_date')
     to_date = args.get('to') or args.get('to_date')
-    county = getattr(user, 'county', None) if user else None
+    user_county = getattr(user, 'county', None) if user else None
+    is_superadmin = bool(user and (user.is_superuser or getattr(user, 'role', None) == 'owner'))
+    if not is_superadmin and user_county:
+        county = user_county
+    else:
+        county = args.get('county') or user_county
     generated_by = getattr(user, 'username', 'AI Assistant') if user else 'AI Assistant'
     return ai_reports.build_standard_report_pdf(
         report_type=report_type, year=year, ward=ward, as_of=as_of,
