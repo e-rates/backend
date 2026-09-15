@@ -2138,7 +2138,10 @@ class ReportsViewSet(viewsets.ViewSet):
             if user is None:
                 return False
             request.user = user
-        return IsAdminOrAuditor().has_permission(request, self)
+            return IsAdminOrAuditor().has_permission(request, self)
+        if request.user and request.user.is_authenticated:
+            return IsAdminOrAuditor().has_permission(request, self)
+        return False
 
     @action(detail=False, methods=['get'], url_path='download', permission_classes=[permissions.AllowAny])
     def download(self, request):
@@ -2176,8 +2179,11 @@ class ReportsViewSet(viewsets.ViewSet):
             content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         response = HttpResponse(body, content_type=content_type)
         response.xframe_options_exempt = True
-        disposition = 'inline' if fmt == 'pdf' else 'attachment'
+        disposition = request.query_params.get('disposition', 'attachment')
+        if disposition not in ('inline', 'attachment'):
+            disposition = 'attachment'
         response['Content-Disposition'] = f'{disposition}; filename="{report.slug}.{fmt}"'
+        response['Content-Length'] = str(len(body))
         return response
 
     @extend_schema(
@@ -2206,7 +2212,11 @@ class ReportsViewSet(viewsets.ViewSet):
 
         pdf_bytes = file_path.read_bytes()
         response = HttpResponse(pdf_bytes, content_type='application/pdf')
-        response['Content-Disposition'] = f'inline; filename="{filename}"'
+        disposition = request.query_params.get('disposition', 'attachment')
+        if disposition not in ('inline', 'attachment'):
+            disposition = 'attachment'
+        response['Content-Disposition'] = f'{disposition}; filename="{filename}"'
+        response['Content-Length'] = str(len(pdf_bytes))
         response.xframe_options_exempt = True
         return response
 
