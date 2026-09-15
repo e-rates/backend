@@ -8,9 +8,10 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from erates import mpesa
-from erates.models import MpesaTransaction, Parcel, Payment, User
+from erates.models import MpesaTransaction, Parcel, Payment, RateSchedule, User
 from erates.payment_flow import generate_rate_bills
 from erates.rates import annual_rate
+from erates.tests.billing import bill_everyone
 
 SECRET = 'cb-secret'
 
@@ -38,7 +39,7 @@ class MpesaFlowTests(APITestCase):
         self.parcel = Parcel.objects.create(
             parcel_ref='NBI/1', geom=square(), county='Nairobi', sub_county='Westlands', owner_user=self.owner,
         )
-        generate_rate_bills(2026, timezone.now() + timedelta(days=30))
+        bill_everyone(2026, timezone.now() + timedelta(days=30))
         self.bill = Payment.objects.get(parcel=self.parcel, payment_year=2026)
         self.client.force_authenticate(self.owner)
 
@@ -59,10 +60,11 @@ class MpesaFlowTests(APITestCase):
         return resp.json()['features'][0]['properties']
 
     def test_bill_amount_uses_flat_band_then_usv(self):
-        self.assertEqual(self.bill.amount, annual_rate(self.parcel))
+        schedule = RateSchedule.objects.get(county__name='Nairobi', year=2026)
+        self.assertEqual(self.bill.amount, annual_rate(self.parcel, schedule))
+        self.assertEqual(generate_rate_bills(schedule)['unchanged'], 1)
         self.parcel.unimproved_site_value = Decimal('10000000')
-        self.assertEqual(annual_rate(self.parcel), Decimal('11500'))
-        self.assertEqual(generate_rate_bills(2026, None), {'created': 0, 'skipped': 1})
+        self.assertEqual(annual_rate(self.parcel, schedule), Decimal('11500'))
 
     def test_successful_payment_greenlights_parcel(self):
         self.assertEqual(self.geojson_status()['payment_status'], 'unpaid')

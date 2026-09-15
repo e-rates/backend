@@ -26,6 +26,7 @@ from drf_spectacular.types import OpenApiTypes
 from rest_framework import serializers as drf_serializers
 
 from .models import (
+    RateSchedule,
     User,
     Account,
     County,
@@ -37,6 +38,7 @@ from .models import (
     AuditLog,
 )
 from .serializers import (
+    RateScheduleSerializer,
     CountySerializer,
     
     UserListSerializer,
@@ -73,7 +75,6 @@ from .serializers import (
     LLMQuerySerializer,
 )
 from . import audit, mpesa, parcel_deletion, payment_flow, rate_reports
-from .rates import annual_rate, rate_explanation
 import hmac
 
 from .shapefile_serializers import (
@@ -1211,8 +1212,8 @@ class ParcelViewSet(viewsets.ModelViewSet):
                 'receipt': bill.processor_ref if bill.status == 'completed' else None,
                 'failure_reason': bill.failure_reason,
                 'basis': (bill.metadata or {}).get('basis'),
-                'explanation': rate_explanation(bill.parcel) if bill.parcel_id else None,
-                'standard_amount': str(annual_rate(bill.parcel)) if bill.parcel_id else None,
+                'explanation': (bill.metadata or {}).get('explanation'),
+                'standard_amount': (bill.metadata or {}).get('standard_amount'),
                 'paid_at': bill.updated_at.isoformat() if bill.status == 'completed' else None,
             },
         }
@@ -2868,3 +2869,56 @@ class ParcelDeletionRequestViewSet(mixins.ListModelMixin,
     @action(detail=True, methods=['post'], permission_classes=[IsPlatformOwner])
     def reject(self, request, pk=None):
         return self._decide(request, approve=False)
+
+
+class RateScheduleViewSet(viewsets.GenericViewSet):
+    """County rates per rating year; issuing a schedule bills every owned parcel in that county."""
+    serializer_class = RateScheduleSerializer
+    permission_classes = [IsAdmin]
+
+    def _county(self, request):
+        name = scope_county(request) or request.data.get('county') or request.query_params.get('county')
+        county = find_county(name) if name else None
+        if not county:
+            raise ValidationError({'county': 'Choose a county that is on the platform.'})
+        return county
+
+    @extend_schema(summary="Saved rate schedules for a county", tags=['Billing'])
+    def list(self, request):
+        schedules = RateSchedule.objects.filter(county=self._county(request)).select_related('county', 'set_by')
+        return Response(self.get_serializer(schedules, many=True).data)
+
+    def _draft(self, request):
+        county = self._county(request)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        existing = RateSchedule.objects.filter(county=county, year=serializer.validated_data['year']).first()
+        return county, serializer.validated_data, existing
+
+    @extend_schema(summary="What issuing a schedule would bill, without billing", tags=['Billing'])
+    @action(detail=False, methods=['post'])
+    def preview(self, request):
+        county, values, existing = self._draft(request)
+        outcome = payment_flow.generate_rate_bills(RateSchedule(county=county, **values), dry_run=True)
+        return Response({**outcome, 'county': county.name, 'replaces_existing': bool(existing)})
+
+    @extend_schema(summary="Save a schedule and bill every owned parcel in the county", tags=['Billing'])
+    @action(detail=False, methods=['post'])
+    def issue(self, request):
+        from django.db import transaction
+
+        county, values, existing = self._draft(request)
+        with transaction.atomic():
+            schedule = existing or RateSchedule(county=county)
+            for field, value in values.items():
+                setattr(schedule, field, value)
+            schedule.set_by = request.user
+            schedule.save()
+            audit.record('rate_schedule.set', obj=schedule, object_type='rate_schedule', county=county.name,
+                         year=schedule.year, bands=schedule.bands, top_amount=str(schedule.top_amount),
+                         usv_rate_percent=str(schedule.usv_rate_percent))
+            outcome = payment_flow.generate_rate_bills(schedule)
+        return Response(
+            {**outcome, 'county': county.name, 'schedule': self.get_serializer(schedule).data},
+            status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED,
+        )

@@ -7,6 +7,17 @@ from zoneinfo import ZoneInfo
 
 from erates.models import County, User, Account, Parcel, ParcelHistory, Payment
 from erates.rates import annual_rate
+from erates.models import County, RateSchedule
+
+DEMO_BANDS = [{'max_ha': '0.1', 'amount': '2560'}, {'max_ha': '0.2', 'amount': '3200'}, {'max_ha': '0.4', 'amount': '4000'}]
+
+
+def _demo_schedule(county_name, year, deadline):
+    county = County.objects.filter(name__iexact=county_name).first() or County.objects.create(name=county_name)
+    schedule, _ = RateSchedule.objects.get_or_create(county=county, year=year, defaults={
+        'bands': DEMO_BANDS, 'top_amount': 4800, 'usv_rate_percent': '0.115', 'deadline': deadline,
+    })
+    return schedule
 
 NAIROBI_TZ = ZoneInfo('Africa/Nairobi')
 
@@ -294,7 +305,7 @@ class Command(BaseCommand):
                 parcel = parcels_by_ref[ref]
                 owner_user, account = users_by_username[p_info["owner"]]
                 is_paid = status_matrix[yr].get(ref, False)
-                amount = annual_rate(parcel)
+                amount = annual_rate(parcel, _demo_schedule(parcel.county, yr, deadline))
                 
                 idempotency_key = f"rates:{ref}:{yr}"
                 st = "completed" if is_paid else "pending"

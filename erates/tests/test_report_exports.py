@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from rest_framework.test import APITestCase
 
 from erates.models import Parcel, Payment, User
-from erates.payment_flow import generate_rate_bills
+from erates.tests.billing import bill_everyone
 
 
 class ReportExportTests(APITestCase):
@@ -20,7 +20,7 @@ class ReportExportTests(APITestCase):
                 parcel_ref=f'P{i}', geom=Polygon.from_bbox((36.8 + i / 100, -1.3, 36.801 + i / 100, -1.299)),
                 county='Nyeri', sub_county='Tetu', ward=ward, owner_user=owner, props={'REG_SECTIO': 'AGUTHI-GAAKI'},
             )
-        generate_rate_bills(2026, timezone.now() + timedelta(days=30))
+        bill_everyone(2026, timezone.now() + timedelta(days=30))
         paid = Payment.objects.get(parcel__parcel_ref='P0')
         paid.status, paid.processor, paid.processor_ref = 'completed', 'mpesa', 'RCPT1'
         paid.save()

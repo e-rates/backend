@@ -6,7 +6,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from erates.models import Parcel, Payment, User
-from erates.payment_flow import generate_rate_bills
+from erates.tests.billing import bill_everyone
 
 
 def square(offset):
@@ -23,7 +23,7 @@ class RateReportTests(APITestCase):
         self.paid = make('A1', 'karura', 0)
         self.overdue = make('A2', 'karura', 1)
         self.unpaid = make('B1', 'mugunda', 2)
-        generate_rate_bills(2026, timezone.now() + timedelta(days=30))
+        bill_everyone(2026, timezone.now() + timedelta(days=30))
         Payment.objects.filter(parcel=self.overdue).update(deadline=timezone.now() - timedelta(days=5))
         bill = Payment.objects.get(parcel=self.paid)
         bill.status, bill.processor_ref = 'completed', 'RCPT123'

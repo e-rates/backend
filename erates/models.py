@@ -705,3 +705,29 @@ class ParcelDeletionRequest(SecurityMixin):
 
     def __str__(self):
         return f"{self.parcel.parcel_ref} deletion ({self.status})"
+
+
+class RateSchedule(SecurityMixin):
+    """What one county charges for one rating year (National Rating Act 2024, s.9)."""
+    schedule_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    county = models.ForeignKey(County, on_delete=models.PROTECT, related_name='rate_schedules')
+    year = models.IntegerField(db_index=True)
+    bands = models.JSONField(help_text='Flat area rates, ascending: [{"max_ha": "0.1", "amount": "2560"}]')
+    top_amount = models.DecimalField(max_digits=12, decimal_places=2, help_text='Flat rate above the largest band')
+    usv_rate_percent = models.DecimalField(
+        max_digits=7, decimal_places=4, help_text='Percent of unimproved site value, for parcels that have one',
+    )
+    deadline = models.DateTimeField()
+    set_by = models.ForeignKey(
+        User, on_delete=models.PROTECT, related_name='rate_schedules_set', null=True, blank=True,
+    )
+
+    class Meta:
+        db_table = 'rate_schedules'
+        ordering = ['county__name', '-year']
+        constraints = [
+            models.UniqueConstraint(fields=['county', 'year'], name='one_rate_schedule_per_county_year'),
+        ]
+
+    def __str__(self):
+        return f"{self.county.name} {self.year}"

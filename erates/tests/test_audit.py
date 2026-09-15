@@ -8,7 +8,7 @@ from rest_framework.test import APITestCase
 
 from erates import mpesa
 from erates.models import AuditLog, Parcel, User
-from erates.payment_flow import generate_rate_bills
+from erates.tests.billing import bill_everyone
 
 
 @override_settings(MPESA_CALLBACK_SECRET='s', MPESA_CALLBACK_URL='https://example.test/cb')
@@ -36,7 +36,7 @@ class AuditTests(APITestCase):
         self.client.force_authenticate(self.admin)
         resp = self.client.post(f'/api/parcels/{self.parcel.pk}/assign_owner/', {'new_owner_id': str(self.owner.pk)}, format='json')
         self.assertEqual(resp.status_code, 200, resp.content)
-        generate_rate_bills(2026, timezone.now() + timedelta(days=30))
+        bill_everyone(2026, timezone.now() + timedelta(days=30))
         bill = self.parcel.payments.get()
 
         self.client.force_authenticate(self.owner)

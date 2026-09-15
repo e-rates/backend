@@ -1,3 +1,4 @@
+from django.utils import timezone
 from rest_framework import serializers
 from rest_framework_gis.serializers import GeoFeatureModelSerializer
 from django.contrib.auth.password_validation import validate_password
@@ -7,6 +8,7 @@ import re
 from drf_spectacular.utils import extend_schema_field
 
 from .models import (
+    RateSchedule,
     User, Account, County, Parcel, ParcelDeletionRequest, ParcelHistory, 
     LedgerEntry, Payment, AuditLog, phone_lookup_hash
 )
@@ -768,3 +770,38 @@ class ParcelDeletionRequestSerializer(serializers.ModelSerializer):
 class ParcelDeletionDecisionSerializer(serializers.Serializer):
     """The platform owner's note when approving or rejecting."""
     decision_note = serializers.CharField(required=False, allow_blank=True, max_length=1000)
+
+
+class RateBandSerializer(serializers.Serializer):
+    max_ha = serializers.DecimalField(max_digits=10, decimal_places=4, min_value=Decimal('0.0001'))
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0'))
+
+
+class RateScheduleSerializer(serializers.ModelSerializer):
+    """A county's rates for one year: flat area bands, a top flat rate and a site-value percentage."""
+    county_name = serializers.CharField(source='county.name', read_only=True)
+    bands = RateBandSerializer(many=True)
+    set_by_username = serializers.CharField(source='set_by.username', read_only=True, default=None)
+
+    class Meta:
+        model = RateSchedule
+        fields = [
+            'schedule_id', 'county', 'county_name', 'year', 'bands', 'top_amount',
+            'usv_rate_percent', 'deadline', 'set_by_username', 'updated_at',
+        ]
+        read_only_fields = ['schedule_id', 'county', 'county_name', 'set_by_username', 'updated_at']
+
+    def validate_year(self, value):
+        current = timezone.now().year
+        if not current - 20 <= value <= current + 1:
+            raise serializers.ValidationError(f'Rating year must be between {current - 20} and {current + 1}.')
+        return value
+
+    def to_representation(self, instance):
+        return {**super().to_representation(instance), 'bands': instance.bands}
+
+    def validate_bands(self, value):
+        return [
+            {'max_ha': format(b['max_ha'].normalize(), 'f'), 'amount': format(b['amount'].normalize(), 'f')}
+            for b in sorted(value, key=lambda b: b['max_ha'])
+        ]

@@ -9,7 +9,7 @@ from rest_framework.test import APITestCase
 
 from erates import assistant
 from erates.models import Parcel, Payment, User
-from erates.payment_flow import generate_rate_bills
+from erates.tests.billing import bill_everyone
 
 
 def _model_reply(messages):
@@ -36,7 +36,7 @@ class AssistantTests(APITestCase):
             parcel_ref='555', geom=Polygon.from_bbox((36.9, -1.3, 36.901, -1.299)),
             county='Nyeri County', sub_county='Tetu', ward='karura',
         )
-        generate_rate_bills(2026, timezone.now() + timedelta(days=30))
+        bill_everyone(2026, timezone.now() + timedelta(days=30))
         Payment.objects.filter(parcel__parcel_ref__in=['317', '900']).update(deadline=timezone.now() - timedelta(days=10))
         self.client.force_authenticate(self.official)
 
@@ -80,9 +80,11 @@ class AssistantTests(APITestCase):
         self.assertEqual(events[0]['sources'], [{'tool': 'ward_parcels', 'args': {'ward': 'karura'}}])
         prompt = json.dumps(llm.call_args.args[0])
         self.assertNotIn('0712345678', prompt)
-        self.assertNotIn('w@example.com', prompt)
-        allocated = {p['plot']: p['owner'] for p in self.facts(llm)['snapshot']['allocated_parcels']}
-        self.assertEqual(allocated, {'1865': 'wanjiru', '317': 'wanjiru'})
+        allocated = {p['plot']: p for p in self.facts(llm)['snapshot']['allocated_parcels']}
+        self.assertEqual(set(allocated), {'1865', '317'})
+        self.assertEqual(allocated['1865']['owner_email'], 'w@example.com')
+        self.assertEqual(allocated['1865']['title_ref'], 'AGUTHI-GAAKI/1865')
+        self.assertEqual(allocated['1865']['bills'], [{'year': 2026, 'amount_kes': '4800.00', 'status': 'unpaid'}])
 
     def test_a_bare_follow_up_reuses_the_previous_question(self):
         history = [{'role': 'user', 'text': 'do we have any data on Nyeri county'}, {'role': 'assistant', 'text': 'Which year?'}]

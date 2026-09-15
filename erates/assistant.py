@@ -93,10 +93,28 @@ def snapshot(county):
         'wards': parcels.exclude(ward__isnull=True).exclude(ward='').values('ward').distinct().count(),
         'rate_bills': bills.count(),
         'paid_bills': bills.filter(status='completed').count(),
-        'allocated_parcels': [
-            {'plot': p.parcel_ref, 'ward': p.ward, 'land_use': p.land_use, 'area_m2': round(p.area_m2 or 0), 'owner': p.owner_user.username}
-            for p in parcels.filter(owner_user__isnull=False).select_related('owner_user')[:10]
-        ],
+        'allocated_parcels': [_parcel_facts(p) for p in parcels.filter(owner_user__isnull=False).select_related('owner_user')[:10]],
+    }
+
+
+def _parcel_facts(parcel):
+    props = parcel.props or {}
+    bills = [
+        {'year': b.payment_year, 'amount_kes': str(b.amount), 'status': rate_reports.bill_state(b)}
+        for b in parcel.payments.filter(is_deleted=False).order_by('-payment_year')[:5]
+    ]
+    return {
+        'plot': parcel.parcel_ref,
+        'title_ref': f"{props['REG_SECTIO']}/{parcel.parcel_ref}" if props.get('REG_SECTIO') else None,
+        'sub_county': parcel.sub_county,
+        'ward': parcel.ward,
+        'village': props.get('USER'),
+        'sheet_no': props.get('SHEET_NO'),
+        'land_use': parcel.land_use,
+        'area_ha': round((parcel.area_m2 or 0) / 10000, 2),
+        'owner': parcel.owner_user.username,
+        'owner_email': parcel.owner_user.email,
+        'bills': bills or 'no bills issued, so nothing has been paid',
     }
 
 

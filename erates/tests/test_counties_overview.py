@@ -5,7 +5,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from erates.models import Parcel, Payment, User
-from erates.payment_flow import generate_rate_bills
+from erates.tests.billing import bill_everyone
 
 
 class CountiesOverviewTests(APITestCase):
@@ -27,7 +27,7 @@ class CountiesOverviewTests(APITestCase):
             parcel_ref='KB1', geom=Polygon.from_bbox((36.9, -1.3, 36.901, -1.299)),
             county='Kiambu', sub_county='Limuru', ward='ndeiya',
         )
-        generate_rate_bills(2026, timezone.now() + timedelta(days=30))
+        bill_everyone(2026, timezone.now() + timedelta(days=30))
         bill = Payment.objects.get(parcel=allocated)
         bill.status = 'completed'
         bill.save()

@@ -7,7 +7,8 @@ from django.utils import timezone
 
 from . import audit, mpesa
 from .models import Account, MpesaTransaction, Parcel, Payment
-from .rates import annual_rate, rate_basis
+from .rate_reports import county_q
+from .rates import annual_rate, rate_basis, rate_explanation
 
 logger = logging.getLogger(__name__)
 
@@ -16,33 +17,52 @@ QUERY_AFTER = timedelta(seconds=25)
 QUERY_EVERY = timedelta(seconds=10)  # Daraja sandbox spike-arrests rapid STK queries
 
 
-def generate_rate_bills(year: int, deadline, parcels=None) -> dict:
-    parcels = parcels if parcels is not None else Parcel.objects.filter(
-        owner_user__isnull=False, is_deleted=False,
+UNPAID = ('pending', 'failed')
+
+
+def generate_rate_bills(schedule, dry_run=False) -> dict:
+    """Bills every owned parcel in the schedule's county; unpaid bills follow a changed schedule, paid ones never do."""
+    parcels = Parcel.objects.filter(
+        county_q('county', schedule.county.name), owner_user__isnull=False, is_deleted=False,
     ).select_related('owner_user')
-    created = skipped = 0
+    created = updated = unchanged = 0
+    total = Decimal(0)
     for parcel in parcels:
-        account, _ = Account.objects.get_or_create(
-            owner_user=parcel.owner_user, account_type='main', defaults={'currency': 'KES'},
+        amount = annual_rate(parcel, schedule)
+        total += amount
+        metadata = {
+            'kind': 'land_rates', 'basis': rate_basis(parcel), 'land_use': parcel.land_use,
+            'explanation': rate_explanation(parcel, schedule), 'standard_amount': str(amount),
+        }
+        bill = Payment.objects.filter(parcel=parcel, payment_year=schedule.year).first()
+        if bill is None:
+            created += 1
+            if not dry_run:
+                account, _ = Account.objects.get_or_create(
+                    owner_user=parcel.owner_user, account_type='main', defaults={'currency': 'KES'},
+                )
+                Payment.objects.create(
+                    idempotency_key=f'rates:{parcel.parcel_ref}:{schedule.year}',
+                    user=parcel.owner_user, account=account, parcel=parcel, payment_year=schedule.year,
+                    amount=amount, deadline=schedule.deadline, metadata=metadata,
+                )
+        elif bill.status in UNPAID and (bill.amount != amount or bill.deadline != schedule.deadline):
+            updated += 1
+            if not dry_run:
+                bill.amount, bill.deadline = amount, schedule.deadline
+                bill.metadata = {**(bill.metadata or {}), **metadata}
+                bill.save()
+        else:
+            unchanged += 1
+    if not dry_run and (created or updated):
+        audit.record(
+            'payment.bills_issued', obj=schedule, object_type='rate_schedule', county=schedule.county.name,
+            year=schedule.year, created=created, updated=updated, deadline=schedule.deadline.isoformat(),
         )
-        _, was_created = Payment.objects.get_or_create(
-            idempotency_key=f'rates:{parcel.parcel_ref}:{year}',
-            defaults={
-                'user': parcel.owner_user,
-                'account': account,
-                'parcel': parcel,
-                'payment_year': year,
-                'amount': annual_rate(parcel),
-                'deadline': deadline,
-                'metadata': {'kind': 'land_rates', 'basis': rate_basis(parcel), 'land_use': parcel.land_use},
-            },
-        )
-        created += was_created
-        skipped += not was_created
-    if created:
-        audit.record('payment.bills_issued', object_type='rating_year', year=year, created=created,
-                     deadline=deadline.isoformat() if deadline else None)
-    return {'created': created, 'skipped': skipped}
+    return {
+        'created': created, 'updated': updated, 'unchanged': unchanged,
+        'parcels': created + updated + unchanged, 'total_billed': str(total),
+    }
 
 
 def latest_push(payment):

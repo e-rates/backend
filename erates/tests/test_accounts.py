@@ -5,7 +5,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from erates.models import AuditLog, Parcel, Payment, User
-from erates.payment_flow import generate_rate_bills
+from erates.tests.billing import bill_everyone
 
 
 def plot(ref, county, ward='karura', offset=0):
@@ -107,7 +107,7 @@ class CountyScopingTests(APITestCase):
         self.nyeri_plot.owner_user, self.kiambu_plot.owner_user = nyeri_owner, kiambu_owner
         self.nyeri_plot.save()
         self.kiambu_plot.save()
-        generate_rate_bills(2026, timezone.now() + timedelta(days=30))
+        bill_everyone(2026, timezone.now() + timedelta(days=30))
 
     def refs(self, url):
         data = self.client.get(url).json()
