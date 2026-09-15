@@ -419,22 +419,55 @@ def stream(question: str, history=None, county=None, user=None):
     facts = {name: r['facts'] for name, _, r in results if r['facts']}
     content = f'QUESTION: {question}'
     if facts:
-        content = f'FACTS: {json.dumps(facts, default=str, separators=(",", ":"))}\n{content}'
+        content = (
+            f'FACTS: {json.dumps(facts, default=str, separators=(",", ":"))}\n'
+            'The official already sees every KES amount on screen. Comment only on the percentages, counts '
+            'and which ward stands out. Write no money amounts.\n'
+            f'{content}'
+        )
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, *_history_messages(history), {'role': 'user', 'content': content}]
     shown = json.dumps(facts, default=str) + ''.join(r['markdown'] for _, _, r in results).replace(',', '')
     allowed = {float(n) for n in re.findall(r'\d+(?:\.\d+)?', shown)}
     pending = ''
+    said = False
     try:
         for delta in _stream_llm(messages):
             pending += delta
             *sentences, pending = re.split(r'(?<=[.!?])\s+', pending)
             for sentence in sentences:
                 if _grounded(sentence, allowed):
+                    said = True
                     yield {'text': sentence + ' '}
         if pending.strip() and _grounded(pending, allowed):
+            said = True
             yield {'text': pending}
     except AssistantError as exc:
         yield {'error': str(exc)}
+        return
+    if not said and facts:
+        comment = _facts_comment(facts)
+        if comment:
+            yield {'text': comment}
+
+
+def _facts_comment(facts):
+    merged = {k: v for tool_facts in facts.values() for k, v in tool_facts.items()}
+    parts = []
+    if isinstance(merged.get('collection_rate_percent'), (int, float)):
+        parts.append(f'collection rate is {merged["collection_rate_percent"]}%')
+    if merged.get('overdue_bills'):
+        n = merged['overdue_bills']
+        parts.append(f'{n} overdue bill{"s" if n != 1 else ""}')
+    if merged.get('ward_with_most_overdue'):
+        parts.append(f'{merged["ward_with_most_overdue"].title()} ward has the most overdue bills')
+    if merged.get('oldest_days_overdue'):
+        parts.append(f'the oldest has been unpaid for {merged["oldest_days_overdue"]} days')
+    if merged.get('years_with_unpaid_bills'):
+        parts.append('unpaid bills remain from ' + ', '.join(str(y) for y in merged['years_with_unpaid_bills']))
+    if not parts:
+        return ''
+    text = '; '.join(parts)
+    return text[0].upper() + text[1:] + '.'
 
 
 def _grounded(sentence, allowed):

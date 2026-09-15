@@ -66,6 +66,12 @@ class AssistantTests(APITestCase):
         events, _ = self.ask('show defaulters', model=invents)
         self.assertTrue(self.text(events).endswith('\n\nThere is 1 overdue bill. Arrears stand at KES 4,800.00. '))
 
+    def test_code_comments_when_every_model_sentence_is_dropped(self):
+        def invents_everything(messages):
+            yield 'Collections reached KES 270,395 across 42 plots.'
+        events, _ = self.ask('show defaulters', model=invents_everything)
+        self.assertTrue(self.text(events).endswith('\n\n1 overdue bill; the oldest has been unpaid for 10 days.'))
+
     def test_model_sees_counts_not_people_or_phones(self):
         events, llm = self.ask('List karura ward plots')
         self.assertEqual(events[0]['sources'], [{'tool': 'ward_parcels', 'args': {'ward': 'karura'}}])
