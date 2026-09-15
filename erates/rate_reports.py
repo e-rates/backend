@@ -194,7 +194,7 @@ def counties(year: int) -> list:
             row['officials'] += people
 
     for county, row in rows.items():
-        bills = Payment.objects.filter(payment_year=year, parcel__county__iexact=county, is_deleted=False).exclude(status='refunded')
+        bills = Payment.objects.filter(county_q('parcel__county', county), payment_year=year, is_deleted=False).exclude(status='refunded')
         totals = bills.aggregate(billed=Sum('amount'))
         collected = bills.filter(status='completed').aggregate(total=Sum('amount'))
         row['billed'] = totals['billed'] or Decimal(0)

@@ -281,7 +281,7 @@ class UserViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = self.queryset
         county = scope_county(self.request)
-        return queryset.filter(county__iexact=county) if county else queryset
+        return queryset.filter(county_q('county', county)) if county else queryset
 
     def perform_destroy(self, instance):
         instance.is_active = False
@@ -1643,7 +1643,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
         queryset = self.queryset
         if county:
             queryset = queryset.filter(
-                Q(parcel__county__iexact=county) | Q(parcel__isnull=True, user__county__iexact=county)
+                county_q('parcel__county', county) | (Q(parcel__isnull=True) & county_q('user__county', county))
             )
         if user_role in ['admin', 'auditor', 'owner']:
             return queryset
@@ -1880,7 +1880,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             
         county = request.query_params.get('county')
         if county:
-            overdue_payments = overdue_payments.filter(user__parcels__county__iexact=county).distinct()
+            overdue_payments = overdue_payments.filter(county_q('user__parcels__county', county)).distinct()
 
         # 4. Search (User details or Parcel Ref)
         search_query = request.query_params.get('search')
@@ -2114,8 +2114,36 @@ class ReportsViewSet(viewsets.ViewSet):
         ],
         responses={200: OpenApiResponse(description='The report file')},
     )
-    @action(detail=False, methods=['get'], url_path='download', permission_classes=[IsAdminOrAuditor])
+    @action(detail=False, methods=['get'], url_path='download-link', permission_classes=[IsAdminOrAuditor])
+    def download_link(self, request):
+        from django.core import signing
+
+        query = request.query_params.copy()
+        path = query.pop('path', ['download'])[0]
+        if path not in ('download', 'ai-download'):
+            return Response({'error': 'Unknown download'}, status=status.HTTP_400_BAD_REQUEST)
+        query['sig'] = signing.TimestampSigner(salt='report-download').sign(str(request.user.pk))
+        return Response({'url': f'/api/reports/{path}/?{query.urlencode()}'})
+
+    def _allow_download(self, request):
+        from django.core import signing
+
+        sig = request.query_params.get('sig')
+        if sig:
+            try:
+                user_id = signing.TimestampSigner(salt='report-download').unsign(sig, max_age=120)
+            except signing.BadSignature:
+                return False
+            user = User.objects.filter(pk=user_id, is_active=True).first()
+            if user is None:
+                return False
+            request.user = user
+        return IsAdminOrAuditor().has_permission(request, self)
+
+    @action(detail=False, methods=['get'], url_path='download', permission_classes=[permissions.AllowAny])
     def download(self, request):
+        if not self._allow_download(request):
+            return Response({'detail': 'This download link has expired. Try again.'}, status=status.HTTP_403_FORBIDDEN)
         from django.http import HttpResponse
         from . import report_builders
 
@@ -2158,8 +2186,10 @@ class ReportsViewSet(viewsets.ViewSet):
         ],
         responses={200: OpenApiResponse(description='The PDF file')},
     )
-    @action(detail=False, methods=['get'], url_path='ai-download', permission_classes=[IsAdminOrAuditor])
+    @action(detail=False, methods=['get'], url_path='ai-download', permission_classes=[permissions.AllowAny])
     def ai_download(self, request):
+        if not self._allow_download(request):
+            return Response({'detail': 'This download link has expired. Try again.'}, status=status.HTTP_403_FORBIDDEN)
         from django.http import HttpResponse
         from pathlib import Path
         import re
@@ -2174,7 +2204,7 @@ class ReportsViewSet(viewsets.ViewSet):
 
         pdf_bytes = file_path.read_bytes()
         response = HttpResponse(pdf_bytes, content_type='application/pdf')
-        response['Content-Disposition'] = f'inline; filename="{filename}"'
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response
 
     permission_classes = [permissions.IsAuthenticated, IsAdminOrAuditor]
@@ -2841,7 +2871,7 @@ class ParcelDeletionRequestViewSet(mixins.ListModelMixin,
     def get_queryset(self):
         county = scope_county(self.request)
         qs = self.queryset
-        return qs.filter(parcel__county__iexact=county) if county else qs
+        return qs.filter(county_q('parcel__county', county)) if county else qs
 
     def _decide(self, request, approve: bool):
         deletion_request = self.get_object()
