@@ -292,6 +292,7 @@ class UserViewSet(viewsets.ModelViewSet):
         password = secrets.token_urlsafe(9)
         user.set_password(password)
         user.must_change_password = True
+        user.failed_login_attempts, user.locked_until = 0, None
         user.save()
         return password
 

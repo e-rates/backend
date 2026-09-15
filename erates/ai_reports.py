@@ -423,7 +423,7 @@ def build_standard_report_pdf(report_type: str = 'collections', year: int = None
     Generates statutory reports (collections, arrears, register) as PDF using report_builders.
     Saves to media/ai_reports and returns download URL.
     """
-    county_name = (county or getattr(settings, 'COUNTY_NAME', 'Kenya')).strip()
+    county_name = (county or '').strip() or None
     kind = (report_type or 'collections').lower().strip()
     today_local = _today()
 

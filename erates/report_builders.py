@@ -9,7 +9,8 @@ from django.conf import settings
 from django.db.models import Q
 from django.utils import timezone
 
-from .models import Payment
+from .models import County, Payment
+from .rate_reports import county_q
 
 NAIROBI = ZoneInfo('Africa/Nairobi')
 OPEN_STATUSES = ('pending', 'processing', 'failed')
@@ -39,6 +40,14 @@ class Report:
     subtitle: str
     summary: list = field(default_factory=list)  # [(label, value, kind)]
     sections: list = field(default_factory=list)
+    county: str = 'All counties'
+
+
+def _county_name(county):
+    if not county:
+        return 'All counties'
+    found = County.objects.filter(county_q('name', county)).first()
+    return found.name if found else county
 
 
 def _local(dt):
@@ -57,7 +66,7 @@ def _title_ref(parcel):
 def collections_report(year: int, county=None) -> Report:
     query = Payment.objects.filter(payment_year=year, parcel__isnull=False, is_deleted=False).exclude(status='refunded')
     if county:
-        query = query.filter(parcel__county__iexact=county)
+        query = query.filter(county_q('parcel__county', county))
     bills = list(query.select_related('parcel'))
     wards = defaultdict(lambda: {'billed_count': 0, 'paid_count': 0, 'billed': Decimal(0), 'collected': Decimal(0)})
     monthly = defaultdict(lambda: {'count': 0, 'amount': Decimal(0)})
@@ -87,6 +96,7 @@ def collections_report(year: int, county=None) -> Report:
         for m, v in sorted(monthly.items())
     ]
     return Report(
+        county=_county_name(county),
         slug=f'collections-{year}',
         title=f'Land rates collections — {year}',
         subtitle=f'Rates billed and collected for the {year} rating year, by ward.',
@@ -115,7 +125,7 @@ def arrears_report(as_of: date, county=None) -> Report:
     cutoff = datetime.combine(as_of, time.max, tzinfo=NAIROBI)
     query = Payment.objects.filter(status__in=OPEN_STATUSES, deadline__lt=cutoff, parcel__isnull=False, is_deleted=False)
     if county:
-        query = query.filter(parcel__county__iexact=county)
+        query = query.filter(county_q('parcel__county', county))
     bills = list(query.select_related('parcel', 'user').order_by('parcel__ward', 'deadline'))
     rows = []
     buckets = defaultdict(lambda: {'count': 0, 'amount': Decimal(0)})
@@ -137,6 +147,7 @@ def arrears_report(as_of: date, county=None) -> Report:
         ward_totals[ward]['oldest'] = max(ward_totals[ward]['oldest'], days)
     total = sum((r['amount'] for r in rows), Decimal(0))
     return Report(
+        county=_county_name(county),
         slug=f'arrears-{as_of.isoformat()}',
         title='Defaulters and arrears',
         subtitle=f'Unpaid rate bills past their deadline as of {as_of.strftime("%d %B %Y")}.',
@@ -168,7 +179,7 @@ def register_report(start: date, end: date, county=None) -> Report:
     until = datetime.combine(end, time.max, tzinfo=NAIROBI)
     query = Payment.objects.filter(status='completed', updated_at__range=(since, until), is_deleted=False)
     if county:
-        query = query.filter(Q(parcel__county__iexact=county) | Q(parcel__isnull=True, user__county__iexact=county))
+        query = query.filter(county_q('parcel__county', county) | (Q(parcel__isnull=True) & county_q('user__county', county)))
     payments = list(query.select_related('parcel', 'user').order_by('updated_at'))
     rows = []
     for p in payments:
@@ -184,6 +195,7 @@ def register_report(start: date, end: date, county=None) -> Report:
     unreconciled = sum(1 for r in rows if r['receipt'] == 'Pending reconciliation')
     period = f'{start.strftime("%d %b %Y")} – {end.strftime("%d %b %Y")}'
     return Report(
+        county=_county_name(county),
         slug=f'payment-register-{start.isoformat()}-to-{end.isoformat()}',
         title='Payment register',
         subtitle=f'Confirmed rate payments received {period}, for reconciliation against the M-Pesa statement.',
@@ -231,7 +243,7 @@ def render_xlsx(report: Report, generated_by: str) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = 'Summary'
-    ws['A1'] = settings.COUNTY_NAME
+    ws['A1'] = report.county
     ws['A1'].font = Font(bold=True, size=12)
     ws['A2'] = report.title
     ws['A2'].font = Font(bold=True, size=16)
@@ -301,7 +313,7 @@ def render_pdf(report: Report, generated_by: str) -> bytes:
             width, height = landscape(A4)
             canvas.setFont('Helvetica-Bold', 9)
             canvas.setFillColor(ink)
-            canvas.drawString(15 * mm, height - 11 * mm, settings.COUNTY_NAME.upper())
+            canvas.drawString(15 * mm, height - 11 * mm, report.county.upper())
             canvas.setFont('Helvetica', 8)
             canvas.setFillColor(muted)
             canvas.drawRightString(width - 15 * mm, height - 11 * mm, report.title)
@@ -313,7 +325,7 @@ def render_pdf(report: Report, generated_by: str) -> bytes:
 
         out = BytesIO()
         doc = SimpleDocTemplate(out, pagesize=landscape(A4), leftMargin=15 * mm, rightMargin=15 * mm,
-                                topMargin=20 * mm, bottomMargin=16 * mm, title=report.title, author=settings.COUNTY_NAME)
+                                topMargin=20 * mm, bottomMargin=16 * mm, title=report.title, author=report.county)
         story = [Paragraph(report.title, h1), Paragraph(report.subtitle, small), Spacer(1, 6 * mm)]
         summary = Table(
             [[Paragraph(label, small) for label, _, _ in report.summary],
